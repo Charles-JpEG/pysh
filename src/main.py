@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
-# Main module for pysh:
-#   - Main shell loop
-#   - Tokenize and group commands
+# Main module for pysh
 
-from dataclasses import dataclass
 import os
-import shlex
 import sys
+import command
+from groups import (
+    split_line,
+    format_groups,
+)
 
 # Optional readline import for key bindings (Ctrl+L clear-screen)
 try:
@@ -15,71 +16,7 @@ try:
 except Exception:  # pragma: no cover - fallback if readline missing
     readline = None  # type: ignore
 
-OPERATORS = {"|", "||", "&&", ";", "&"}
-
-@dataclass
-class CommandGroup:
-    parts: list[str]
-
-@dataclass
-class OperatorGroup:
-    op: str
-
-Group = CommandGroup | OperatorGroup
-
-
-# Line to Tokens
-def tokenize(line: str) -> list[str]:
-    lexer = shlex.shlex(line, posix=True, punctuation_chars=';&|')
-    lexer.commenters = ''
-    lexer.whitespace_split = True
-    raw = list(lexer)
-    out: list[str] = []
-    i = 0
-    while i < len(raw):
-        t = raw[i]
-        if t in ('&', '|') and i + 1 < len(raw) and raw[i + 1] == t:
-            out.append(t * 2)
-            i += 2
-            continue
-        out.append(t)
-        i += 1
-    return out
-
-
-# Tokens to Groups
-def group_tokens(tokens: list[str]) -> list[Group]:
-    groups: list[Group] = []
-    buf: list[str] = []
-    def flush():
-        nonlocal buf
-        if buf:
-            groups.append(CommandGroup(buf))
-            buf = []
-    for tok in tokens:
-        if tok in OPERATORS:
-            flush()
-            groups.append(OperatorGroup(tok))
-        else:
-            buf.append(tok)
-    flush()
-    return groups
-
-
-# Line to Groups
-def split_line(line: str) -> list[Group]:
-    return group_tokens(tokenize(line))
-
-
-# Format groups for display <TEST>
-def format_groups(groups: list[Group]) -> str:
-    lines: list[str] = []
-    for g in groups:
-        if isinstance(g, CommandGroup):
-            lines.append("CMD  " + ' '.join(g.parts))
-        else:
-            lines.append("OP   " + g.op)
-    return "\n".join(lines) if lines else "<empty>"
+## Parsing helpers now imported from groups.py
 
 
 def main():
@@ -131,8 +68,8 @@ def main():
         if not line:
             continue
         groups = split_line(line)
-        # Display Command <TEST>
-        print(format_groups(groups))
+        # Execute command
+        pass
 
 if __name__ == '__main__':
     main()
