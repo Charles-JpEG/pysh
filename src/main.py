@@ -10,7 +10,7 @@ from typing import Optional
 
 PROMPT = "> "
 
-from ops import CommandRunner, ShellSession  # local module in the same folder
+from ops import CommandRunner, ShellSession, execute_line  # local module in the same folder
 
 
 def get_default_shell() -> str:
@@ -64,10 +64,27 @@ def repl() -> int:
             # Empty line: prompt again
             continue
 
-        # Forward the exact line to the user's shell without any parsing.
-        runner = CommandRunner(line=line, shell=shell, env=session.get_env())
-        runner.shell_run()
-        last_runner = runner
+        # If the line contains shell operators we support, execute via our engine; else run as a simple command
+        if any(op in line for op in ('|', '&&', '||', ';', '&', '>', '>>', '<')):
+            # Parse and execute the structured commands; this prints directly via subprocess I/O
+            try:
+                exit_code = execute_line(line, session)
+                # Create a synthetic runner to store exit code; stdout/stderr not captured in pipeline mode
+                runner = CommandRunner(line=line, shell=shell, env=session.get_env())
+                runner.exit_code = exit_code
+                runner.stdout = None
+                runner.stderr = None
+                last_runner = runner
+            except Exception as e:
+                print(f"pysh: parse/exec error: {e}", file=sys.stderr)
+                # record failure
+                runner = CommandRunner(line=line, shell=shell, env=session.get_env())
+                runner.exit_code = 1
+                last_runner = runner
+        else:
+            runner = CommandRunner(line=line, shell=shell, env=session.get_env())
+            runner.shell_run()
+            last_runner = runner
 
     # If loop exits via EOF, return the last exit code we saw (default 0).
     return (last_runner.exit_code if last_runner and last_runner.exit_code is not None else 0)
