@@ -227,8 +227,15 @@ def _parse_simple_proper(tokens: List[str], i: int) -> Tuple[SimpleCommand, int]
         t = tokens[i]
         if t in ('|', '&&', '||', ';', '&'):
             break
-        if t in ('>', '>>', '<') or t.isdigit():
+        if t in ('>', '>>', '<', '>&'):
             i = _parse_redirection(tokens, i, cmd)
+        elif t.isdigit():
+            # Interpret as fd redirection only if followed by a redirection operator
+            if i + 1 < len(tokens) and tokens[i + 1] in ('>', '>>', '<', '>&'):
+                i = _parse_redirection(tokens, i, cmd)
+            else:
+                cmd.argv.append(t)
+                i += 1
         else:
             cmd.argv.append(t)
             i += 1
