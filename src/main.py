@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
+from typing import Optional
 
 PROMPT = "> "
+
+from ops import CommandRunner, ShellSession  # local module in the same folder
 
 
 def get_default_shell() -> str:
@@ -40,10 +42,11 @@ def setup_readline() -> None:
 
 def repl() -> int:
     shell = get_default_shell()
+    session = ShellSession(shell=shell, inherit_env=True)
 
     setup_readline()
 
-    last_status = 0
+    last_runner: Optional[CommandRunner] = None
     while True:
         try:
             # Preserve the line exactly as typed (no strip/rstrip)
@@ -62,21 +65,12 @@ def repl() -> int:
             continue
 
         # Forward the exact line to the user's shell without any parsing.
-        try:
-            completed = subprocess.run([shell, "-c", line])
-            last_status = completed.returncode
-        except KeyboardInterrupt:
-            # SIGINT during command: keep wrapper alive
-            print()
-            last_status = 130
-        except FileNotFoundError:
-            print(f"pysh: shell not found: {shell}", file=sys.stderr)
-            return 127
-        except Exception as e:
-            print(f"pysh: error: {e}", file=sys.stderr)
-            last_status = 1
+        runner = CommandRunner(line=line, shell=shell, env=session.get_env())
+        runner.shell_run()
+        last_runner = runner
 
-    return last_status
+    # If loop exits via EOF, return the last exit code we saw (default 0).
+    return (last_runner.exit_code if last_runner and last_runner.exit_code is not None else 0)
 
 
 def main() -> None:
