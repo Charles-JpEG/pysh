@@ -143,6 +143,8 @@ def _tokenize(line: str) -> List[str]:
                 combined.append('>>'); i += 2; continue
             if t == '<' and t2 == '<':
                 combined.append('<<'); i += 2; continue
+            if t == '>' and t2 == '&':
+                combined.append('>&'); i += 2; continue
         combined.append(t)
         i += 1
     return combined
@@ -172,20 +174,26 @@ def _parse_redirection(tokens: List[str], i: int, cmd: SimpleCommand) -> int:
         op = tokens[j]
         j += 1
 
-    if op in ('>', '>>', '<'):
-        if j >= len(tokens):
-            raise ValueError("redirection missing target")
-        target = tokens[j]
-        cmd.redirs.append(Redirection(fd, op, target))
+    # Dup redirection: n>&m must be checked before normal file redirection
+    if op == '>&':
+        if j >= len(tokens) or not is_int(tokens[j]):
+            raise ValueError("dup redirection requires numeric fd target, e.g., 2>&1")
+        to_fd = int(tokens[j])
+        cmd.redirs.append(Redirection(fd, 'dup', to_fd))
         return j + 1
-
-    # Dup redirection: n>&m
     if op == '>' and j < len(tokens) and tokens[j] == '&':
         if j + 1 >= len(tokens) or not is_int(tokens[j + 1]):
             raise ValueError("dup redirection requires numeric fd target, e.g., 2>&1")
         to_fd = int(tokens[j + 1])
         cmd.redirs.append(Redirection(fd, 'dup', to_fd))
         return j + 2
+
+    if op in ('>', '>>', '<'):
+        if j >= len(tokens):
+            raise ValueError("redirection missing target")
+        target = tokens[j]
+        cmd.redirs.append(Redirection(fd, op, target))
+        return j + 1
 
     raise ValueError(f"unsupported redirection near: {' '.join(tokens[i:j+1])}")
 
@@ -363,15 +371,21 @@ def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:
 
 def _exec_sequence(units: List[SequenceUnit], session: ShellSession) -> int:
     last = 0
-    for u in units:
+    i = 0
+    while i < len(units):
+        u = units[i]
         ec = _exec_pipeline(u.pipeline, session)
         last = ec
+        # Decide whether to execute the next unit depending on the operator attached to this one
         if u.next_op == '&&' and ec != 0:
-            # Skip until next unit after this operator
+            # Skip the next unit
+            i += 2
             continue
         if u.next_op == '||' and ec == 0:
+            # Skip the next unit
+            i += 2
             continue
-        # ';' or None just proceed
+        i += 1
     return last
 
 
