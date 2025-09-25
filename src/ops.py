@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import ast
+import shutil
 from typing import Optional, Dict, List, Tuple, Any
 
 
@@ -48,6 +49,14 @@ class ShellSession:
     def unset_var(self, name: str) -> None:
         if name in self.py_vars:
             del self.py_vars[name]
+
+
+# Commands that are "preserved" and must resolve to system commands when invoked.
+GUARANTEED_COMMANDS: set[str] = {
+    'cd', 'ls', 'pwd', 'mkdir', 'rmdir', 'rm', 'cp', 'mv', 'find', 'basename', 'dirname',
+    'echo', 'cat', 'head', 'tail', 'wc', 'grep', 'sort', 'uniq', 'cut',
+    'date', 'uname', 'ps', 'which', 'env', 'fd', 'rg'
+}
 
 
 def _expand_vars_in_line(line: str, session: ShellSession) -> str:
@@ -164,6 +173,13 @@ def _try_python_assignment(line: str, session: ShellSession) -> Optional[int]:
     except SyntaxError:
         return None
 
+    # Disallow assigning to names that are preserved commands
+    for nm in names:
+        if nm in GUARANTEED_COMMANDS:
+            sys.stderr.write(f"pysh: cannot assign to preserved command name: {nm}\n")
+            sys.stderr.flush()
+            return 1
+
     # Build an execution local namespace seeded with both env and current py vars
     # so RHS can reference them.
     exec_locals: Dict[str, Any] = dict(session.env)
@@ -183,40 +199,51 @@ def _try_python_assignment(line: str, session: ShellSession) -> Optional[int]:
 
 
 def try_python(line: str, session: ShellSession) -> Optional[int]:
-    """Public API: Execute Python statements/expressions.
+    """Public API: Execute arbitrary Python code, updating session.py_vars.
 
-    - If line is valid Python (imports, assignments, general statements), execute it with
-      access to prior Python vars and env values (as strings). Assignments update session.py_vars.
-    - If it's a single expression, evaluate and print its repr() to stdout.
-    - On SyntaxError, return None (so shell path can handle it). On other errors, print and return 1.
+    Returns exit code if executed (0 on success, 1 on error), or None if parsing fails.
+    Intended for explicit Python execution (REPL or tests). Command selection logic lives in execute_line.
     """
     try:
         tree = ast.parse(line, mode='exec')
     except SyntaxError:
         return None
 
+    # Block assigning to preserved command names anywhere in the top-level code
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            # Collect target names
+            names: List[str] = []
+            def collect(t: ast.AST) -> None:
+                if isinstance(t, ast.Name):
+                    names.append(t.id)
+                elif isinstance(t, (ast.Tuple, ast.List)):
+                    for elt in t.elts:
+                        collect(elt)
+            try:
+                if isinstance(node, ast.Assign):
+                    for t in node.targets:
+                        collect(t)
+                else:
+                    collect(node.target)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            for nm in names:
+                if nm in GUARANTEED_COMMANDS:
+                    sys.stderr.write(f"pysh: cannot assign to preserved command name: {nm}\n")
+                    sys.stderr.flush()
+                    return 1
+
     exec_locals: Dict[str, Any] = dict(session.env)
     exec_locals.update(session.py_vars)
     try:
-        # If single expression, evaluate and print
-        if len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
-            expr = ast.Expression(tree.body[0].value)
-            val = eval(compile(expr, '<pysh>', 'eval'), {"__builtins__": __builtins__}, exec_locals)
-            if val is not None:
-                sys.stdout.write(repr(val) + "\n")
-                sys.stdout.flush()
-            return 0
-
-        # General statements (assignments, imports, etc.)
         code = compile(tree, '<pysh>', 'exec')
         exec(code, {"__builtins__": __builtins__}, exec_locals)
-
-        # Sync back any names that look newly set/changed compared to env baseline
+        # Sync back names (including imports)
         for k, v in exec_locals.items():
             if k in ("__builtins__",):
                 continue
-            # Only store Python identifiers
-            if k and (k[0] == '_' or not (k[0].isalpha() or k[0] == '_')):
+            if not k or not (k[0].isalpha() or k[0] == '_'):
                 continue
             session.py_vars[k] = v
         return 0
@@ -354,7 +381,7 @@ def has_operators(line: str) -> bool:
     # Determine if line contains shell operators that we handle
     ops = {'|', '&&', '||', ';', '&', '>', '>>', '<'}
     toks = _tokenize(line)
-    return any(t in ops or (t.isdigit() and i + 1 < len(toks) and toks[i + 1] in ('>', '>>', '>&')) for i, t in enumerate(toks))
+    return any(t in ops or (t.isdigit() and i + 1 < len(toks) and toks[i + 1] in ('>&',)) for i, t in enumerate(toks))
 
 
 def _parse_redirection(tokens: List[str], i: int, cmd: SimpleCommand) -> int:
@@ -430,8 +457,9 @@ def _parse_simple_proper(tokens: List[str], i: int) -> Tuple[SimpleCommand, int]
         if t in ('>', '>>', '<', '>&'):
             i = _parse_redirection(tokens, i, cmd)
         elif t.isdigit():
-            # Interpret as fd redirection only if followed by a redirection operator
-            if i + 1 < len(tokens) and tokens[i + 1] in ('>', '>>', '<', '>&'):
+            # Interpret as fd redirection only for dup syntax (n>&m).
+            # Do NOT treat a bare number before '>' as fd (e.g., 'echo 10 > f')
+            if i + 1 < len(tokens) and tokens[i + 1] in ('>&',):
                 i = _parse_redirection(tokens, i, cmd)
             else:
                 cmd.argv.append(t)
@@ -517,6 +545,28 @@ def _apply_redirections(cmd: SimpleCommand) -> Tuple[Optional[int], Optional[int
 
 
 def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:
+    # Handle built-in 'cd' when it's not part of a pipeline and without redirections
+    if len(p.commands) == 1:
+        cmd0 = p.commands[0]
+        if cmd0.argv and cmd0.argv[0] == 'cd' and not cmd0.redirs:
+            # cd [dir]
+            target = None
+            if len(cmd0.argv) == 1:
+                target = session.get_env().get('HOME') or os.path.expanduser('~')
+            else:
+                target = cmd0.argv[1]
+            try:
+                os.chdir(target)
+                # Update PWD in both environment and python vars to keep them in sync
+                newpwd = os.getcwd()
+                session.env['PWD'] = newpwd
+                session.py_vars['PWD'] = newpwd
+                return 0
+            except Exception as e:
+                sys.stderr.write(f"pysh: cd: {e}\n")
+                sys.stderr.flush()
+                return 1
+
     procs: List[subprocess.Popen] = []
     prev_stdout = None
     open_handles: List = []
@@ -605,18 +655,44 @@ def _exec_sequence(units: List[SequenceUnit], session: ShellSession) -> int:
 
 
 def execute_line(line: str, session: ShellSession) -> int:
-    # Python assignment handling
+    # First, try fast-path Python assignment
     handled = _try_python_assignment(line, session)
     if handled is not None:
         return handled
 
-    # Expand variables before parsing/execution so pipelines and simple commands see expanded args
-    line = _expand_vars_in_line(line, session)
-    tokens = _tokenize(line)
-    if not tokens:
-        return 0
-    units = _parse_sequence(tokens)
-    return _exec_sequence(units, session)
+    # Decide route: shell vs python fallback per spec.
+    # If the line contains shell operators, treat as shell.
+    if has_operators(line):
+        expanded = _expand_vars_in_line(line, session)
+        tokens = _tokenize(expanded)
+        if not tokens:
+            return 0
+        units = _parse_sequence(tokens)
+        return _exec_sequence(units, session)
+
+    # No operators: check if first token is an available command (PATH) or built-in like 'cd'.
+    import shlex as _shlex
+    lex = _shlex.shlex(line, posix=True)
+    lex.whitespace_split = True
+    simple_tokens = list(lex)
+    if simple_tokens:
+        cmd = simple_tokens[0]
+        if cmd == 'cd' or shutil.which(cmd, mode=os.F_OK | os.X_OK, path=session.get_env().get('PATH', os.defpath)):
+            expanded = _expand_vars_in_line(line, session)
+            tokens = _tokenize(expanded)
+            if not tokens:
+                return 0
+            units = _parse_sequence(tokens)
+            return _exec_sequence(units, session)
+
+    # Fallback: execute as Python code
+    rc = try_python(line, session)
+    if rc is None:
+        # Not valid Python; emulate shell 'command not found'
+        sys.stderr.write(f"pysh: command or python code not found: {line}\n")
+        sys.stderr.flush()
+        return 127
+    return rc
 
 
 # Public helper for the REPL to expand variables in simple commands before delegating to the system shell

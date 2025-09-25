@@ -10,7 +10,7 @@ from typing import Optional
 
 PROMPT = "> "
 
-from ops import CommandRunner, ShellSession, execute_line, expand_line, try_python  # local module in the same folder
+from ops import CommandRunner, ShellSession, execute_line  # local module in the same folder
 
 
 def get_default_shell() -> str:
@@ -64,39 +64,19 @@ def repl() -> int:
             # Empty line: prompt again
             continue
 
-    # If the line contains shell operators we support, execute via our engine; else run as a simple command
-        # If this is a Python assignment/import-like statement, execute in Python first
-        py_res = try_python(line, session)
-        if py_res is not None:
-            # emulate shell: print nothing; just set exit code context
+        # Delegate to unified executor which prefers shell commands for preserved names and PATH commands,
+        # and falls back to Python only when appropriate per spec.
+        try:
+            exit_code = execute_line(line, session)
             runner = CommandRunner(line=line, shell=shell, env=session.get_env())
-            runner.exit_code = py_res
+            runner.exit_code = exit_code
             runner.stdout = None
             runner.stderr = None
             last_runner = runner
-            continue
-
-        if any(op in line for op in ('|', '&&', '||', ';', '&', '>', '>>', '<')):
-            # Parse and execute the structured commands; this prints directly via subprocess I/O
-            try:
-                exit_code = execute_line(line, session)
-                # Create a synthetic runner to store exit code; stdout/stderr not captured in pipeline mode
-                runner = CommandRunner(line=line, shell=shell, env=session.get_env())
-                runner.exit_code = exit_code
-                runner.stdout = None
-                runner.stderr = None
-                last_runner = runner
-            except Exception as e:
-                print(f"pysh: parse/exec error: {e}", file=sys.stderr)
-                # record failure
-                runner = CommandRunner(line=line, shell=shell, env=session.get_env())
-                runner.exit_code = 1
-                last_runner = runner
-        else:
-            # Expand variables in simple commands prior to shell execution
-            expanded = expand_line(line, session)
-            runner = CommandRunner(line=expanded, shell=shell, env=session.get_env())
-            runner.shell_run()
+        except Exception as e:
+            print(f"pysh: parse/exec error: {e}", file=sys.stderr)
+            runner = CommandRunner(line=line, shell=shell, env=session.get_env())
+            runner.exit_code = 1
             last_runner = runner
 
     # If loop exits via EOF, return the last exit code we saw (default 0).
