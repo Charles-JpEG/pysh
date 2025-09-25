@@ -97,9 +97,10 @@ def _expand_vars_in_line(line: str, session: ShellSession) -> str:
             i += 1
             continue
         if ch == '\\' and not in_single:
-            # Escape next character (if any)
-            if i + 1 < n:
-                out.append(line[i + 1])
+            # For expansion, only consume backslash when escaping a dollar sign.
+            # Otherwise, preserve the backslash for the tokenizer to handle.
+            if i + 1 < n and line[i + 1] == '$':
+                out.append('$')
                 i += 2
                 continue
             else:

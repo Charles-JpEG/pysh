@@ -128,6 +128,48 @@ def test_env_contains_sanitized_vars(sess: ShellSession, tmp: Path):
     assert run_line("env", sess) in (0, 1)
 
 
+# ---- Quote/operator edge cases ----
+
+def test_quoted_pipe_literal(sess: ShellSession, tmp: Path):
+    # '|' inside quotes must not be treated as a pipe operator
+    assert run_line("echo 'a|b' > qp.txt", sess) in (0, 1)
+    out = (tmp / 'qp.txt').read_text().strip()
+    assert out == 'a|b'
+
+
+def test_escaped_pipe_literal(sess: ShellSession, tmp: Path):
+    # Escaped pipe in unquoted context should be literal
+    assert run_line("echo a\|b > ep.txt", sess) in (0, 1)
+    out = (tmp / 'ep.txt').read_text().strip()
+    assert out == 'a|b'
+
+
+def test_operators_inside_quotes(sess: ShellSession, tmp: Path):
+    # Ensure logical OR '||' inside quotes is not parsed as operator
+    assert run_line("echo 'x||y' > qo.txt", sess) in (0, 1)
+    out = (tmp / 'qo.txt').read_text().strip()
+    assert out == 'x||y'
+
+
+def test_quoted_pipe_with_pipeline(sess: ShellSession, tmp: Path):
+    # Mix a real pipeline with a quoted pipe character in argument
+    assert run_line("printf 'a|b\n' | grep -F 'a|b' > mix.txt", sess) in (0, 1)
+    out = (tmp / 'mix.txt').read_text()
+    assert out == 'a|b\n'
+
+
+def test_dup_redirection_spaced_forms(sess: ShellSession, tmp: Path):
+    # Both compact and spaced dup forms should work: 2>&1 and 2 >& 1 / 2 > & 1
+    # 1) Compact form already covered elsewhere; test spaced variants here
+    assert run_line("sh -c 'echo out; echo err 1>&2' >o2.txt 2 >& 1", sess) in (0, 1)
+    text = (tmp / 'o2.txt').read_text()
+    assert 'out\n' in text and 'err\n' in text
+    # 2) With explicit separation between '>' and '&'
+    assert run_line("sh -c 'echo out; echo err 1>&2' >o3.txt 2 > & 1", sess) in (0, 1)
+    text2 = (tmp / 'o3.txt').read_text()
+    assert 'out\n' in text2 and 'err\n' in text2
+
+
 def test_find_txt_files(sess: ShellSession, tmp: Path):
     # Create structure under a dedicated root to avoid capturing output files
     search = tmp / "search"
@@ -1055,6 +1097,12 @@ def collect_tests(extend: bool):
         test_pipeline_grep,
         test_redirection_and_dup,
         test_to_devnull,
+        # Quote/operator edge cases
+        test_quoted_pipe_literal,
+        test_escaped_pipe_literal,
+        test_operators_inside_quotes,
+        test_quoted_pipe_with_pipeline,
+        test_dup_redirection_spaced_forms,
         test_conditionals,
         test_background,
         test_simple_command_runner_capture,
