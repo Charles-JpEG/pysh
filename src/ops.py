@@ -154,14 +154,20 @@ def _expand_vars_in_line(line: str, session: ShellSession, *, force_double: bool
 
 
 def _expand_word(word: str, quoting: str, session: ShellSession) -> str:
-    # Handle quoting
-    if quoting == 'single':
+    # Handle sentinel markers injected during tokenization
+    if word.startswith("\x00S"):
         # Single-quoted: return literally, no expansion
-        return word
-    force_double = (quoting == 'double')
+        return word[2:]
+    force_double = False
+    if word.startswith("\x00D"):
+        force_double = True
+        word = word[2:]
     # Expand command substitutions first, then variables
     s = _expand_command_substitutions(word, session, for_python=False)
     s = _expand_vars_in_line(s, session, force_double=force_double)
+    # Expand ~ at start of unquoted words
+    if quoting == 'unquoted' and s.startswith('~'):
+        s = os.path.expanduser(s)
     return s
 
 
@@ -413,8 +419,10 @@ def _tokenize(line: str) -> List[Token]:
             quoting = 'unquoted'
             if buf_seen_single and not buf_seen_double and not buf_seen_unquoted:
                 quoting = 'single'
+                val = '\x00S' + val
             elif buf_seen_double and not buf_seen_single and not buf_seen_unquoted:
                 quoting = 'double'
+                val = '\x00D' + val
             tokens.append(Token('WORD', val, quoting))
             buf.clear()
             buf_seen_single = buf_seen_double = buf_seen_unquoted = False
@@ -714,8 +722,6 @@ def _apply_redirections(cmd: SimpleCommand) -> Tuple[Optional[int], Optional[int
     stderr_fd = None
     closers: List = []
 
-    # Track dup stderr to stdout
-    dup_stderr_to_stdout = False
     for r in cmd.redirs:
         if r.op == '<':
             f = open(r.target, 'rb')
@@ -737,14 +743,14 @@ def _apply_redirections(cmd: SimpleCommand) -> Tuple[Optional[int], Optional[int
                 stderr_fd = f.fileno()
         elif r.op == 'dup':
             if r.fd == 2 and isinstance(r.target, int) and r.target == 1:
-                dup_stderr_to_stdout = True
+                stderr_fd = stdout_fd
             else:
                 # Minimal support: only 2>&1
                 raise ValueError("only 2>&1 is supported for dup redirection right now")
         else:
             raise ValueError(f"unsupported redirection: {r.op}")
 
-    return stdin_fd, stdout_fd, (subprocess.STDOUT if dup_stderr_to_stdout else stderr_fd), closers
+    return stdin_fd, stdout_fd, stderr_fd, closers
 
 
 def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:

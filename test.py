@@ -128,6 +128,18 @@ def test_env_contains_sanitized_vars(sess: ShellSession, tmp: Path):
     assert run_line("env", sess) in (0, 1)
 
 
+def test_tilde_expansion(sess: ShellSession, tmp: Path):
+    # ~ should expand to home directory when used at start of unquoted path
+    out = _run_and_read("echo ~", tmp / 'o.txt', sess).strip()
+    assert out == str(Path.home())
+
+
+def test_ls_tilde(sess: ShellSession, tmp: Path):
+    # ls ~ should expand ~ and list home directory
+    rc = run_line("ls ~", sess)
+    assert rc == 0
+
+
 # ---- Quote/operator edge cases ----
 
 def test_quoted_pipe_literal(sess: ShellSession, tmp: Path):
@@ -399,7 +411,7 @@ def build_guaranteed_command_tests():
     def pwd_4(sess: ShellSession, tmp: Path):
         # PWD env should track real pwd
         out = _run_and_read("echo $PWD", tmp / 'o.txt', sess).strip()
-        assert out == str(tmp)
+        assert out == os.getcwd()
 
     def pwd_5(sess: ShellSession, tmp: Path):
         # After cd, PWD updates
@@ -1107,6 +1119,8 @@ def collect_tests(extend: bool):
         test_background,
         test_simple_command_runner_capture,
         test_env_contains_sanitized_vars,
+        test_tilde_expansion,
+        test_ls_tilde,
         test_find_txt_files,
         test_find_and_wc_count,
         test_sort_basic,
