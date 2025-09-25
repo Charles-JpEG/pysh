@@ -65,7 +65,7 @@ def _expand_vars_in_line(line: str, session: ShellSession) -> str:
     Rules (pysh simplified):
     - No expansion inside single quotes '...'
     - Expansion allowed in unquoted and double-quoted contexts
-    - Backslash escapes next char (so \$ yields literal $) outside single quotes
+    - Backslash escapes next char (so \\$ yields literal $) outside single quotes
     - Undefined vars expand to empty string
     """
     out: List[str] = []
@@ -655,13 +655,7 @@ def _exec_sequence(units: List[SequenceUnit], session: ShellSession) -> int:
 
 
 def execute_line(line: str, session: ShellSession) -> int:
-    # First, try fast-path Python assignment
-    handled = _try_python_assignment(line, session)
-    if handled is not None:
-        return handled
-
-    # Decide route: shell vs python fallback per spec.
-    # If the line contains shell operators, treat as shell.
+    # Route selection per spec: prefer shell operators and commands first.
     if has_operators(line):
         expanded = _expand_vars_in_line(line, session)
         tokens = _tokenize(expanded)
@@ -670,7 +664,7 @@ def execute_line(line: str, session: ShellSession) -> int:
         units = _parse_sequence(tokens)
         return _exec_sequence(units, session)
 
-    # No operators: check if first token is an available command (PATH) or built-in like 'cd'.
+    # No operators: check command presence first
     import shlex as _shlex
     lex = _shlex.shlex(line, posix=True)
     lex.whitespace_split = True
@@ -685,10 +679,13 @@ def execute_line(line: str, session: ShellSession) -> int:
             units = _parse_sequence(tokens)
             return _exec_sequence(units, session)
 
-    # Fallback: execute as Python code
+    # Not a shell command: attempt Python (assignment fast-path first to set vars quietly)
+    handled = _try_python_assignment(line, session)
+    if handled is not None:
+        return handled
+
     rc = try_python(line, session)
     if rc is None:
-        # Not valid Python; emulate shell 'command not found'
         sys.stderr.write(f"pysh: command or python code not found: {line}\n")
         sys.stderr.flush()
         return 127
