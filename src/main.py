@@ -10,7 +10,7 @@ from typing import Optional
 
 PROMPT = "> "
 
-from ops import CommandRunner, ShellSession, execute_line  # local module in the same folder
+from ops import CommandRunner, ShellSession, execute_line, expand_line, try_python  # local module in the same folder
 
 
 def get_default_shell() -> str:
@@ -64,7 +64,18 @@ def repl() -> int:
             # Empty line: prompt again
             continue
 
-        # If the line contains shell operators we support, execute via our engine; else run as a simple command
+    # If the line contains shell operators we support, execute via our engine; else run as a simple command
+        # If this is a Python assignment/import-like statement, execute in Python first
+        py_res = try_python(line, session)
+        if py_res is not None:
+            # emulate shell: print nothing; just set exit code context
+            runner = CommandRunner(line=line, shell=shell, env=session.get_env())
+            runner.exit_code = py_res
+            runner.stdout = None
+            runner.stderr = None
+            last_runner = runner
+            continue
+
         if any(op in line for op in ('|', '&&', '||', ';', '&', '>', '>>', '<')):
             # Parse and execute the structured commands; this prints directly via subprocess I/O
             try:
@@ -82,7 +93,9 @@ def repl() -> int:
                 runner.exit_code = 1
                 last_runner = runner
         else:
-            runner = CommandRunner(line=line, shell=shell, env=session.get_env())
+            # Expand variables in simple commands prior to shell execution
+            expanded = expand_line(line, session)
+            runner = CommandRunner(line=expanded, shell=shell, env=session.get_env())
             runner.shell_run()
             last_runner = runner
 

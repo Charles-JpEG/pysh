@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from typing import Optional, Dict, List, Tuple
+import ast
+from typing import Optional, Dict, List, Tuple, Any
 
 
 class ShellSession:
@@ -18,12 +19,211 @@ class ShellSession:
 
     def __init__(self, shell: str, inherit_env: bool = True) -> None:
         self.shell: str = shell
+        # String-only environment used as base for subprocesses
         self.env: Dict[str, str] = dict(os.environ) if inherit_env else {}
+    # Python variable space: holds Python objects defined by the user via assignments
+    # Does not include inherited env by default; env is merged at get_env/expansion time
+        self.py_vars: Dict[str, Any] = {}
         self.background_jobs: List[List[subprocess.Popen]] = []
 
     def get_env(self) -> Dict[str, str]:
-        # Return a copy to prevent accidental external mutation
-        return dict(self.env)
+        # Merge string env with stringified Python vars; Python vars take precedence
+        merged = dict(self.env)
+        for k, v in self.py_vars.items():
+            try:
+                merged[k] = str(v)
+            except Exception:
+                merged[k] = repr(v)
+        return merged
+
+    # --- Python variable helpers ---
+    def get_var(self, name: str) -> Optional[Any]:
+        if name in self.py_vars:
+            return self.py_vars[name]
+        return self.env.get(name)
+
+    def set_var(self, name: str, value: Any) -> None:
+        self.py_vars[name] = value
+
+    def unset_var(self, name: str) -> None:
+        if name in self.py_vars:
+            del self.py_vars[name]
+
+
+def _expand_vars_in_line(line: str, session: ShellSession) -> str:
+    """Expand $var and ${var} using session vars/env.
+
+    Rules (pysh simplified):
+    - No expansion inside single quotes '...'
+    - Expansion allowed in unquoted and double-quoted contexts
+    - Backslash escapes next char (so \$ yields literal $) outside single quotes
+    - Undefined vars expand to empty string
+    """
+    out: List[str] = []
+    i = 0
+    n = len(line)
+    in_single = False
+    in_double = False
+    while i < n:
+        ch = line[i]
+        if ch == "'":
+            in_single = not in_single if not in_double else in_single
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = not in_double if not in_single else in_double
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '\\' and not in_single:
+            # Escape next character (if any)
+            if i + 1 < n:
+                out.append(line[i + 1])
+                i += 2
+                continue
+            else:
+                out.append('\\')
+                i += 1
+                continue
+        if ch == '$' and not in_single:
+            # Parse variable name
+            if i + 1 < n and line[i + 1] == '{':
+                # ${var}
+                j = i + 2
+                name_chars: List[str] = []
+                while j < n and line[j] != '}':
+                    name_chars.append(line[j])
+                    j += 1
+                if j < n and line[j] == '}':
+                    var_name = ''.join(name_chars)
+                    val = session.get_var(var_name)
+                    out.append('' if val is None else str(val))
+                    i = j + 1
+                    continue
+                else:
+                    # No closing }, treat literally
+                    out.append('$')
+                    i += 1
+                    continue
+            else:
+                # $var_name
+                j = i + 1
+                if j < n and ((line[j] == '_' or line[j].isalpha())):
+                    name_chars: List[str] = []
+                    while j < n and (line[j] == '_' or line[j].isalnum()):
+                        name_chars.append(line[j])
+                        j += 1
+                    var_name = ''.join(name_chars)
+                    val = session.get_var(var_name)
+                    out.append('' if val is None else str(val))
+                    i = j
+                    continue
+                else:
+                    # Not a valid var expansion ($ followed by non-name)
+                    out.append('$')
+                    i += 1
+                    continue
+        # default
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+def _try_python_assignment(line: str, session: ShellSession) -> Optional[int]:
+    """Detect and execute simple Python assignments like: x = 10, a, b = (1, 2).
+
+    Returns an int exit code (0/1) if handled, else None if the line is not an assignment.
+    """
+    try:
+        tree = ast.parse(line, mode='exec')
+    except SyntaxError:
+        return None
+    # Only handle a single Assign statement
+    if not tree.body or len(tree.body) != 1:
+        return None
+    node = tree.body[0]
+    if not isinstance(node, ast.Assign):
+        return None
+
+    # Collect target names
+    names: List[str] = []
+    def collect(t: ast.AST) -> None:
+        if isinstance(t, ast.Name):
+            names.append(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for elt in t.elts:
+                collect(elt)
+        else:
+            # Unsupported complex target like attribute or subscription
+            raise SyntaxError("unsupported assignment target")
+
+    try:
+        for tgt in node.targets:
+            collect(tgt)
+    except SyntaxError:
+        return None
+
+    # Build an execution local namespace seeded with both env and current py vars
+    # so RHS can reference them.
+    exec_locals: Dict[str, Any] = dict(session.env)
+    exec_locals.update(session.py_vars)
+    try:
+        compiled = compile(tree, '<pysh>', 'exec')
+        exec(compiled, {"__builtins__": __builtins__}, exec_locals)
+        # Pull assigned values back into python vars
+        for nm in names:
+            if nm in exec_locals:
+                session.set_var(nm, exec_locals[nm])
+        return 0
+    except Exception as e:
+        sys.stderr.write(f"pysh: python error: {e}\n")
+        sys.stderr.flush()
+        return 1
+
+
+def try_python(line: str, session: ShellSession) -> Optional[int]:
+    """Public API: Execute Python statements/expressions.
+
+    - If line is valid Python (imports, assignments, general statements), execute it with
+      access to prior Python vars and env values (as strings). Assignments update session.py_vars.
+    - If it's a single expression, evaluate and print its repr() to stdout.
+    - On SyntaxError, return None (so shell path can handle it). On other errors, print and return 1.
+    """
+    try:
+        tree = ast.parse(line, mode='exec')
+    except SyntaxError:
+        return None
+
+    exec_locals: Dict[str, Any] = dict(session.env)
+    exec_locals.update(session.py_vars)
+    try:
+        # If single expression, evaluate and print
+        if len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
+            expr = ast.Expression(tree.body[0].value)
+            val = eval(compile(expr, '<pysh>', 'eval'), {"__builtins__": __builtins__}, exec_locals)
+            if val is not None:
+                sys.stdout.write(repr(val) + "\n")
+                sys.stdout.flush()
+            return 0
+
+        # General statements (assignments, imports, etc.)
+        code = compile(tree, '<pysh>', 'exec')
+        exec(code, {"__builtins__": __builtins__}, exec_locals)
+
+        # Sync back any names that look newly set/changed compared to env baseline
+        for k, v in exec_locals.items():
+            if k in ("__builtins__",):
+                continue
+            # Only store Python identifiers
+            if k and (k[0] == '_' or not (k[0].isalpha() or k[0] == '_')):
+                continue
+            session.py_vars[k] = v
+        return 0
+    except Exception as e:
+        sys.stderr.write(f"pysh(py): {e}\n")
+        sys.stderr.flush()
+        return 1
 
 
 class CommandRunner:
@@ -334,12 +534,20 @@ def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:
 
             stderr = stderr_fd if stderr_fd is not None else None
 
+            # Spec tweak: default grep engine is PCRE (-P) unless an engine flag is provided
+            if cmd.argv:
+                prog = os.path.basename(cmd.argv[0])
+                if prog == 'grep':
+                    engine_flags = {'-E', '--extended-regexp', '-F', '--fixed-strings', '-G', '--basic-regexp', '-P', '--perl-regexp'}
+                    if not any(a in engine_flags for a in cmd.argv[1:]):
+                        cmd.argv.insert(1, '-P')
+
             proc = subprocess.Popen(
                 cmd.argv,
                 stdin=stdin,
                 stdout=stdout,
                 stderr=stderr,
-                env=session.env,
+                env=session.get_env(),
             )
             procs.append(proc)
 
@@ -397,8 +605,20 @@ def _exec_sequence(units: List[SequenceUnit], session: ShellSession) -> int:
 
 
 def execute_line(line: str, session: ShellSession) -> int:
+    # Python assignment handling
+    handled = _try_python_assignment(line, session)
+    if handled is not None:
+        return handled
+
+    # Expand variables before parsing/execution so pipelines and simple commands see expanded args
+    line = _expand_vars_in_line(line, session)
     tokens = _tokenize(line)
     if not tokens:
         return 0
     units = _parse_sequence(tokens)
     return _exec_sequence(units, session)
+
+
+# Public helper for the REPL to expand variables in simple commands before delegating to the system shell
+def expand_line(line: str, session: ShellSession) -> str:
+    return _expand_vars_in_line(line, session)
