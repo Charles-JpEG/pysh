@@ -10,13 +10,15 @@ from typing import Optional, Dict, List, Tuple, Any
 
 # ---- Token model for parsing (word vs operator) ----
 class Token:
-    def __init__(self, kind: str, value: str) -> None:
+    def __init__(self, kind: str, value: str, quoting: str = 'unquoted') -> None:
         # kind in { 'WORD', 'OP' }
+        # quoting in { 'unquoted', 'single', 'double' }
         self.kind = kind
         self.value = value
+        self.quoting = quoting
 
     def __repr__(self) -> str:
-        return f"Token({self.kind!r}, {self.value!r})"
+        return f"Token({self.kind!r}, {self.value!r}, {self.quoting!r})"
 
 
 class ShellSession:
@@ -70,7 +72,7 @@ GUARANTEED_COMMANDS: set[str] = {
 }
 
 
-def _expand_vars_in_line(line: str, session: ShellSession) -> str:
+def _expand_vars_in_line(line: str, session: ShellSession, *, force_double: bool = False) -> str:
     """Expand $var and ${var} using session vars/env.
 
     Rules (pysh simplified):
@@ -83,7 +85,7 @@ def _expand_vars_in_line(line: str, session: ShellSession) -> str:
     i = 0
     n = len(line)
     in_single = False
-    in_double = False
+    in_double = force_double
     while i < n:
         ch = line[i]
         if ch == "'":
@@ -149,6 +151,18 @@ def _expand_vars_in_line(line: str, session: ShellSession) -> str:
         out.append(ch)
         i += 1
     return ''.join(out)
+
+
+def _expand_word(word: str, quoting: str, session: ShellSession) -> str:
+    # Handle quoting
+    if quoting == 'single':
+        # Single-quoted: return literally, no expansion
+        return word
+    force_double = (quoting == 'double')
+    # Expand command substitutions first, then variables
+    s = _expand_command_substitutions(word, session, for_python=False)
+    s = _expand_vars_in_line(s, session, force_double=force_double)
+    return s
 
 
 def _try_python_assignment(line: str, session: ShellSession) -> Optional[int]:
@@ -246,6 +260,26 @@ def try_python(line: str, session: ShellSession) -> Optional[int]:
                     sys.stderr.flush()
                     return 1
 
+    # Handle expression statements (like bare variable names) by evaluating and printing
+    if len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
+        expr = tree.body[0].value
+        eval_locals: Dict[str, Any] = dict(session.env)
+        eval_locals.update(session.py_vars)
+        try:
+            val = eval(compile(ast.Expression(body=expr), '<pysh>', 'eval'), {"__builtins__": __builtins__}, eval_locals)
+            # Print the value like REPL; update last value to underscore variable _
+            try:
+                session.py_vars['_'] = val
+            except Exception:
+                pass
+            sys.stdout.write(str(val) + "\n")
+            sys.stdout.flush()
+            return 0
+        except Exception as e:
+            sys.stderr.write(f"pysh(py-eval): {e}\n")
+            sys.stderr.flush()
+            return 1
+
     exec_locals: Dict[str, Any] = dict(session.env)
     exec_locals.update(session.py_vars)
     try:
@@ -341,8 +375,8 @@ class Redirection:
 
 
 class SimpleCommand:
-    def __init__(self, argv: List[str]) -> None:
-        self.argv = argv
+    def __init__(self, argv: List[Tuple[str, str]]) -> None:
+        self.argv = argv  # list of (value, quoting)
         self.redirs: List[Redirection] = []
 
 
@@ -366,11 +400,24 @@ def _tokenize(line: str) -> List[Token]:
     n = len(line)
     in_single = False
     in_double = False
+    # Track context for current buffer to mark fully quoted tokens
+    buf_seen_single = False
+    buf_seen_double = False
+    buf_seen_unquoted = False
 
     def flush_buf() -> None:
+        nonlocal buf_seen_single, buf_seen_double, buf_seen_unquoted
         if buf:
-            tokens.append(Token('WORD', ''.join(buf)))
+            val = ''.join(buf)
+            # Determine quoting
+            quoting = 'unquoted'
+            if buf_seen_single and not buf_seen_double and not buf_seen_unquoted:
+                quoting = 'single'
+            elif buf_seen_double and not buf_seen_single and not buf_seen_unquoted:
+                quoting = 'double'
+            tokens.append(Token('WORD', val, quoting))
             buf.clear()
+            buf_seen_single = buf_seen_double = buf_seen_unquoted = False
 
     while i < n:
         ch = line[i]
@@ -385,11 +432,29 @@ def _tokenize(line: str) -> List[Token]:
         if ch == '\\' and not in_single:
             # Escape next character
             if i + 1 < n:
-                buf.append(line[i + 1])
+                nxt = line[i + 1]
+                # Preserve escape before '$' so expansion can detect it
+                if nxt == '$':
+                    buf.append('\\')
+                    buf.append('$')
+                else:
+                    buf.append(nxt)
+                if in_single:
+                    buf_seen_single = True
+                elif in_double:
+                    buf_seen_double = True
+                else:
+                    buf_seen_unquoted = True
                 i += 2
                 continue
             else:
                 buf.append('\\')
+                if in_single:
+                    buf_seen_single = True
+                elif in_double:
+                    buf_seen_double = True
+                else:
+                    buf_seen_unquoted = True
                 i += 1
                 continue
         if not in_single and not in_double:
@@ -419,10 +484,89 @@ def _tokenize(line: str) -> List[Token]:
                 continue
         # Default: accumulate character
         buf.append(ch)
+        if in_single:
+            buf_seen_single = True
+        elif in_double:
+            buf_seen_double = True
+        else:
+            buf_seen_unquoted = True
         i += 1
 
     flush_buf()
     return tokens
+
+
+def _expand_command_substitutions(line: str, session: ShellSession, *, for_python: bool) -> str:
+    """Expand $(...) by executing the inner text via the system shell.
+
+    - Respects quoting: disabled in single quotes; allowed in double quotes and unquoted.
+    - Supports nested parentheses within $(...).
+    - Trims trailing newlines from the command output (shell-like behavior).
+    - When for_python=True, inserts a Python string literal representing the output.
+      When for_python=False, inserts the raw text (no further quoting is added).
+    """
+    out: List[str] = []
+    i = 0
+    n = len(line)
+    in_single = False
+    in_double = False
+
+    while i < n:
+        ch = line[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '$' and i + 1 < n and line[i + 1] == '(' and not in_single:
+            # find matching closing ')', handle nesting and escapes
+            j = i + 2
+            depth = 1
+            while j < n:
+                c = line[j]
+                if c == '\\' and j + 1 < n:
+                    j += 2
+                    continue
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if j >= n or depth != 0:
+                # Unmatched, treat '$' literally
+                out.append('$')
+                i += 1
+                continue
+            inner = line[i + 2:j]
+            try:
+                completed = subprocess.run(
+                    [session.shell, '-c', inner],
+                    capture_output=True,
+                    text=True,
+                    env=session.get_env(),
+                )
+                subst = completed.stdout.rstrip('\n')
+            except Exception as e:
+                subst = f"<pysh-error:{e}>"
+
+            if for_python:
+                # Insert as Python string literal
+                out.append(repr(subst))
+            else:
+                out.append(subst)
+            i = j + 1
+            continue
+        # default
+        out.append(ch)
+        i += 1
+    return ''.join(out)
 
 
 def has_operators(line: str) -> bool:
@@ -521,10 +665,10 @@ def _parse_simple_proper(tokens: List[Token], i: int) -> Tuple[SimpleCommand, in
             ):
                 i = _parse_redirection(tokens, i, cmd)
             else:
-                cmd.argv.append(t.value)
+                cmd.argv.append((t.value, t.quoting))
                 i += 1
         else:
-            cmd.argv.append(t.value)
+            cmd.argv.append((t.value, t.quoting))
             i += 1
     return cmd, i
 
@@ -607,13 +751,13 @@ def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:
     # Handle built-in 'cd' when it's not part of a pipeline and without redirections
     if len(p.commands) == 1:
         cmd0 = p.commands[0]
-        if cmd0.argv and cmd0.argv[0] == 'cd' and not cmd0.redirs:
+        if cmd0.argv and cmd0.argv[0][0] == 'cd' and not cmd0.redirs:
             # cd [dir]
             target = None
             if len(cmd0.argv) == 1:
                 target = session.get_env().get('HOME') or os.path.expanduser('~')
             else:
-                target = cmd0.argv[1]
+                target = _expand_word(cmd0.argv[1][0], cmd0.argv[1][1], session)
             try:
                 os.chdir(target)
                 # Update PWD in both environment and python vars to keep them in sync
@@ -631,7 +775,21 @@ def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:
     open_handles: List = []
     try:
         for idx, cmd in enumerate(p.commands):
+            # Expand argv and redirection targets per word
+            local_argv = [_expand_word(value, quoting, session) for value, quoting in cmd.argv]
+            # Apply default grep engine tweak on expanded argv
+            if local_argv:
+                prog_name = os.path.basename(local_argv[0])
+            else:
+                prog_name = ''
+
+            # Expand redirection targets
+            for r in cmd.redirs:
+                if r.op in ('>', '>>', '<') and isinstance(r.target, str):
+                    r.target = _expand_word(r.target, 'unquoted', session)
+
             stdin_fd, stdout_fd, stderr_fd, closers = _apply_redirections(cmd)
+            open_handles.extend(closers)
             open_handles.extend(closers)
 
             stdin = prev_stdout if prev_stdout is not None else (stdin_fd if stdin_fd is not None else None)
@@ -644,15 +802,13 @@ def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:
             stderr = stderr_fd if stderr_fd is not None else None
 
             # Spec tweak: default grep engine is PCRE (-P) unless an engine flag is provided
-            if cmd.argv:
-                prog = os.path.basename(cmd.argv[0])
-                if prog == 'grep':
-                    engine_flags = {'-E', '--extended-regexp', '-F', '--fixed-strings', '-G', '--basic-regexp', '-P', '--perl-regexp'}
-                    if not any(a in engine_flags for a in cmd.argv[1:]):
-                        cmd.argv.insert(1, '-P')
+            if prog_name == 'grep':
+                engine_flags = {'-E', '--extended-regexp', '-F', '--fixed-strings', '-G', '--basic-regexp', '-P', '--perl-regexp'}
+                if not any(a in engine_flags for a in local_argv[1:]):
+                    local_argv.insert(1, '-P')
 
             proc = subprocess.Popen(
-                cmd.argv,
+                local_argv,
                 stdin=stdin,
                 stdout=stdout,
                 stderr=stderr,
@@ -714,10 +870,18 @@ def _exec_sequence(units: List[SequenceUnit], session: ShellSession) -> int:
 
 
 def execute_line(line: str, session: ShellSession) -> int:
-    # Route selection per spec: prefer shell operators and commands first.
-    if has_operators(line):
-        expanded = _expand_vars_in_line(line, session)
-        tokens = _tokenize(expanded)
+    # Prepare both Python and shell views of the line
+    line_py = _expand_command_substitutions(line, session, for_python=True)
+    # Fast path: if this is a Python assignment, handle it first regardless of operators in substituted text
+    handled = _try_python_assignment(line_py, session)
+    if handled is not None:
+        return handled
+
+    line_shell = _expand_command_substitutions(line, session, for_python=False)
+    # Route selection per spec: prefer shell operators and commands next.
+    if has_operators(line_shell):
+        # Tokenize without pre-expanding variables to preserve escapes and quoting
+        tokens = _tokenize(line_shell)
         if not tokens:
             return 0
         units = _parse_sequence(tokens)
@@ -725,25 +889,22 @@ def execute_line(line: str, session: ShellSession) -> int:
 
     # No operators: check command presence first
     import shlex as _shlex
-    lex = _shlex.shlex(line, posix=True)
+    lex = _shlex.shlex(line_shell, posix=True)
     lex.whitespace_split = True
     simple_tokens = list(lex)
     if simple_tokens:
         cmd = simple_tokens[0]
         if cmd == 'cd' or shutil.which(cmd, mode=os.F_OK | os.X_OK, path=session.get_env().get('PATH', os.defpath)):
-            expanded = _expand_vars_in_line(line, session)
-            tokens = _tokenize(expanded)
+            tokens = _tokenize(line_shell)
             if not tokens:
                 return 0
             units = _parse_sequence(tokens)
             return _exec_sequence(units, session)
 
     # Not a shell command: attempt Python (assignment fast-path first to set vars quietly)
-    handled = _try_python_assignment(line, session)
-    if handled is not None:
-        return handled
-
-    rc = try_python(line, session)
+    # Expand command substitutions for Python context (as string literals)
+    line_py = _expand_command_substitutions(line, session, for_python=True)
+    rc = try_python(line_py, session)
     if rc is None:
         sys.stderr.write(f"pysh: command or python code not found: {line}\n")
         sys.stderr.flush()
