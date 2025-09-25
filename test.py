@@ -15,6 +15,8 @@ import os
 import shutil
 import sys
 import tempfile
+import subprocess
+import random
 from pathlib import Path
 
 # Allow importing from src/
@@ -976,6 +978,77 @@ def test_rg_count(sess: ShellSession, tmp: Path):
     assert n == 2
 
 
+# ---- Extended comparison test: pysh vs system shell on a multi-step pipeline ----
+def test_compare_pysh_vs_shell_phonebook(sess: ShellSession, tmp: Path):
+    # Requires standard tools
+    if not has_cmd("sed"):
+        raise SkipTest("sed not installed")
+    if not has_cmd("nl"):
+        raise SkipTest("nl not installed")
+
+    rng = random.Random(42)
+    names = [
+        "Harry Potter", "Hermione Granger", "Ron Weasley", "Albus Dumbledore",
+        "Severus Snape", "Rubeus Hagrid", "Minerva McGonagall", "Sirius Black",
+        "Remus Lupin", "Draco Malfoy"
+    ]
+    rng.shuffle(names)
+    def phone() -> str:
+        return ''.join(rng.choice('0123456789') for _ in range(9))
+
+    # Create two separate sandboxes: one for pysh, one for system shell
+    py_dir = tmp / 'pb_pysh'
+    sh_dir = tmp / 'pb_shell'
+    py_dir.mkdir(exist_ok=True)
+    sh_dir.mkdir(exist_ok=True)
+
+    py_file = py_dir / 'test.psv'
+    sh_file = sh_dir / 'test.psv'
+    content_lines = [f"{n}|{phone()}" for n in names]
+    py_file.write_text('\n'.join(content_lines) + '\n')
+    sh_file.write_text('\n'.join(content_lines) + '\n')
+
+    # Environment for both
+    env = sandbox_env(tmp)
+
+    # --- pysh path (interactive via same session) ---
+    shell = os.environ.get("SHELL", "/bin/sh")
+    sess_py = ShellSession(shell=shell, inherit_env=False)
+    sess_py.env.update(env)
+
+    # Task1: cat phonebook
+    os.chdir(py_dir)
+    assert run_line("cat test.psv > cat_out.txt", sess_py) in (0, 1)
+
+    # Task2: sort by name (field 1), then generate line numbers as id, write to phonebook.psv
+    # Using 'nl' for stable numbering with a '|' separator
+    cmd2 = "sort -t '|' -k1,1 test.psv | nl -ba -w1 -s '|' > phonebook.psv"
+    assert run_line(cmd2, sess_py) in (0, 1)
+
+    # Task3: lowercase names in place (left side of the first '|')
+    # GNU sed: \L to lower-case capture group
+    cmd3 = "sed -i -E 's/^([^|]+)/\\L\\1/' phonebook.psv"
+    assert run_line(cmd3, sess_py) in (0, 1)
+
+    # --- system shell path ---
+    os.chdir(sh_dir)
+    sh = os.environ.get("SHELL", "/bin/sh")
+
+    def sh_run(cmd: str) -> None:
+        r = subprocess.run([sh, "-c", cmd], cwd=sh_dir, env=env, capture_output=True, text=True)
+        if r.returncode not in (0, 1):
+            raise AssertionError(f"shell cmd failed: {cmd}\nstdout: {r.stdout}\nstderr: {r.stderr}")
+
+    sh_run("cat test.psv > cat_out.txt")
+    sh_run("sort -t '|' -k1,1 test.psv | nl -ba -w1 -s '|' > phonebook.psv")
+    sh_run("sed -i -E 's/^([^|]+)/\\L\\1/' phonebook.psv")
+
+    # --- Compare outputs exactly ---
+    os.chdir(tmp)  # ensure no lingering cwd locks
+    assert (py_dir / 'cat_out.txt').read_text() == (sh_dir / 'cat_out.txt').read_text()
+    assert (py_dir / 'phonebook.psv').read_text() == (sh_dir / 'phonebook.psv').read_text()
+
+
 def collect_tests(extend: bool):
     base_tests = [
         test_pwd_and_fs_ops,
@@ -1009,6 +1082,7 @@ def collect_tests(extend: bool):
         test_fd_find_txt_files,
         test_rg_search,
         test_rg_count,
+        test_compare_pysh_vs_shell_phonebook,
     ]
 
 

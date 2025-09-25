@@ -8,6 +8,17 @@ import shutil
 from typing import Optional, Dict, List, Tuple, Any
 
 
+# ---- Token model for parsing (word vs operator) ----
+class Token:
+    def __init__(self, kind: str, value: str) -> None:
+        # kind in { 'WORD', 'OP' }
+        self.kind = kind
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f"Token({self.kind!r}, {self.value!r})"
+
+
 class ShellSession:
     """Holds session-wide shell context like environment variables.
 
@@ -347,96 +358,140 @@ class SequenceUnit:
         self.next_op = next_op
 
 
-def _tokenize(line: str) -> List[str]:
-    import shlex as _shlex
-
-    # Split punctuation so operators are separate tokens
-    lex = _shlex.shlex(line, posix=True, punctuation_chars='|&;<>')
-    lex.whitespace_split = True
-    tokens = list(lex)
-
-    # Combine multi-char operators: &&, ||, >>, <<, 2>&1 patterns will be handled in parser
-    combined: List[str] = []
+def _tokenize(line: str) -> List[Token]:
+    tokens: List[Token] = []
+    buf: List[str] = []
     i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if i + 1 < len(tokens):
-            t2 = tokens[i + 1]
-            if t == '&' and t2 == '&':
-                combined.append('&&'); i += 2; continue
-            if t == '|' and t2 == '|':
-                combined.append('||'); i += 2; continue
-            if t == '>' and t2 == '>':
-                combined.append('>>'); i += 2; continue
-            if t == '<' and t2 == '<':
-                combined.append('<<'); i += 2; continue
-            if t == '>' and t2 == '&':
-                combined.append('>&'); i += 2; continue
-        combined.append(t)
+    n = len(line)
+    in_single = False
+    in_double = False
+
+    def flush_buf() -> None:
+        if buf:
+            tokens.append(Token('WORD', ''.join(buf)))
+            buf.clear()
+
+    while i < n:
+        ch = line[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if ch == '\\' and not in_single:
+            # Escape next character
+            if i + 1 < n:
+                buf.append(line[i + 1])
+                i += 2
+                continue
+            else:
+                buf.append('\\')
+                i += 1
+                continue
+        if not in_single and not in_double:
+            # Whitespace separates arguments
+            if ch.isspace():
+                flush_buf()
+                i += 1
+                continue
+            # Operators
+            if ch in ('|', '&', ';', '<', '>'):
+                flush_buf()
+                # Lookahead for two-char operators
+                if i + 1 < n:
+                    nxt = line[i + 1]
+                    if ch == '&' and nxt == '&':
+                        tokens.append(Token('OP', '&&')); i += 2; continue
+                    if ch == '|' and nxt == '|':
+                        tokens.append(Token('OP', '||')); i += 2; continue
+                    if ch == '>' and nxt == '>':
+                        tokens.append(Token('OP', '>>')); i += 2; continue
+                    if ch == '<' and nxt == '<':
+                        tokens.append(Token('OP', '<<')); i += 2; continue
+                    if ch == '>' and nxt == '&':
+                        tokens.append(Token('OP', '>&')); i += 2; continue
+                tokens.append(Token('OP', ch))
+                i += 1
+                continue
+        # Default: accumulate character
+        buf.append(ch)
         i += 1
-    return combined
+
+    flush_buf()
+    return tokens
 
 
 def has_operators(line: str) -> bool:
-    # Determine if line contains shell operators that we handle
-    ops = {'|', '&&', '||', ';', '&', '>', '>>', '<'}
-    toks = _tokenize(line)
-    return any(t in ops or (t.isdigit() and i + 1 < len(toks) and toks[i + 1] in ('>&',)) for i, t in enumerate(toks))
+    # Quote-aware scan for pipe/and/or/sequence/redirection via typed tokens
+    tokens = _tokenize(line)
+    for t in tokens:
+        if t.kind == 'OP':
+            if t.value in {'|', '&&', '||', ';', '&', '>', '>>', '<', '>&'}:
+                return True
+    return False
 
 
-def _parse_redirection(tokens: List[str], i: int, cmd: SimpleCommand) -> int:
+def _parse_redirection(tokens: List[Token], i: int, cmd: SimpleCommand) -> int:
     # Supports: > file, >> file, < file, [n]> file, [n]>> file, 2>&1
     # tokens[i] is either '>', '>>', '<' or an int fd followed by those
-    def is_int(s: str) -> bool:
-        return s.isdigit()
+    def is_int_tok(tok: Token) -> bool:
+        return tok.kind == 'WORD' and tok.value.isdigit()
 
     fd: int = 1
-    op = tokens[i]
+    op_tok = tokens[i]
     j = i + 1
-    if is_int(op):
+    if is_int_tok(op_tok):
         # numeric fd specified
         if j >= len(tokens):
             raise ValueError("redirection missing operator after fd")
-        fd = int(op)
-        op = tokens[j]
+        fd = int(op_tok.value)
+        op_tok = tokens[j]
         j += 1
 
     # Dup redirection: n>&m must be checked before normal file redirection
-    if op == '>&':
-        if j >= len(tokens) or not is_int(tokens[j]):
+    if op_tok.kind == 'OP' and op_tok.value == '>&':
+        if j >= len(tokens) or not is_int_tok(tokens[j]):
             raise ValueError("dup redirection requires numeric fd target, e.g., 2>&1")
-        to_fd = int(tokens[j])
+        to_fd = int(tokens[j].value)
         cmd.redirs.append(Redirection(fd, 'dup', to_fd))
         return j + 1
-    if op == '>' and j < len(tokens) and tokens[j] == '&':
-        if j + 1 >= len(tokens) or not is_int(tokens[j + 1]):
+    if op_tok.kind == 'OP' and op_tok.value == '>' and j < len(tokens) and tokens[j].kind == 'OP' and tokens[j].value == '&':
+        if j + 1 >= len(tokens) or not is_int_tok(tokens[j + 1]):
             raise ValueError("dup redirection requires numeric fd target, e.g., 2>&1")
-        to_fd = int(tokens[j + 1])
+        to_fd = int(tokens[j + 1].value)
+        cmd.redirs.append(Redirection(fd, 'dup', to_fd))
+        return j + 2
+    # Allow spaced form: n > & m
+    if op_tok.kind == 'OP' and op_tok.value == '>' and j + 1 < len(tokens) and tokens[j].kind == 'OP' and tokens[j].value == '&' and is_int_tok(tokens[j + 1]):
+        to_fd = int(tokens[j + 1].value)
         cmd.redirs.append(Redirection(fd, 'dup', to_fd))
         return j + 2
 
-    if op in ('>', '>>', '<'):
+    if op_tok.kind == 'OP' and op_tok.value in ('>', '>>', '<'):
         if j >= len(tokens):
             raise ValueError("redirection missing target")
-        target = tokens[j]
-        cmd.redirs.append(Redirection(fd, op, target))
+        target_tok = tokens[j]
+        cmd.redirs.append(Redirection(fd, op_tok.value, target_tok.value))
         return j + 1
 
-    raise ValueError(f"unsupported redirection near: {' '.join(tokens[i:j+1])}")
+    raise ValueError(f"unsupported redirection near: {' '.join(t.value for t in tokens[i:j+1])}")
 
 
-def _parse_simple(tokens: List[str], i: int) -> Tuple[SimpleCommand, int]:
+def _parse_simple(tokens: List[Token], i: int) -> Tuple[SimpleCommand, int]:
     argv: List[str] = []
     while i < len(tokens):
         t = tokens[i]
-        if t in ('|', '&&', '||', ';', '&'):
+        if t.kind == 'OP' and t.value in ('|', '&&', '||', ';', '&'):
             break
         # redirection starts: either operator or leading numeric fd
-        if t in ('>', '>>', '<') or t.isdigit():
+        if (t.kind == 'OP' and t.value in ('>', '>>', '<')) or (t.kind == 'WORD' and t.value.isdigit()):
             i = _parse_redirection(tokens, i, SimpleCommand(argv) if False else None)  # type: ignore
             # The above line is placeholder to satisfy typing in mypy-like tools; will be replaced below
         else:
-            argv.append(t)
+            argv.append(t.value)
             i += 1
         # To actually record redirs on the current command, we need the command object.
     # Now reconstruct by walking again to attach redirs; simpler: parse in one pass with a command object.
@@ -448,35 +503,38 @@ def _parse_simple(tokens: List[str], i: int) -> Tuple[SimpleCommand, int]:
     # Let's implement properly in a single pass instead of above.
 
 
-def _parse_simple_proper(tokens: List[str], i: int) -> Tuple[SimpleCommand, int]:
+def _parse_simple_proper(tokens: List[Token], i: int) -> Tuple[SimpleCommand, int]:
     cmd = SimpleCommand(argv=[])
     while i < len(tokens):
         t = tokens[i]
-        if t in ('|', '&&', '||', ';', '&'):
+        if t.kind == 'OP' and t.value in ('|', '&&', '||', ';', '&'):
             break
-        if t in ('>', '>>', '<', '>&'):
+        if t.kind == 'OP' and t.value in ('>', '>>', '<', '>&'):
             i = _parse_redirection(tokens, i, cmd)
-        elif t.isdigit():
+        elif t.kind == 'WORD' and t.value.isdigit():
             # Interpret as fd redirection only for dup syntax (n>&m).
             # Do NOT treat a bare number before '>' as fd (e.g., 'echo 10 > f')
-            if i + 1 < len(tokens) and tokens[i + 1] in ('>&',):
+            if i + 1 < len(tokens) and (
+                (tokens[i + 1].kind == 'OP' and tokens[i + 1].value in ('>&',)) or
+                (tokens[i + 1].kind == 'OP' and tokens[i + 1].value == '>' and i + 2 < len(tokens) and tokens[i + 2].kind == 'OP' and tokens[i + 2].value == '&')
+            ):
                 i = _parse_redirection(tokens, i, cmd)
             else:
-                cmd.argv.append(t)
+                cmd.argv.append(t.value)
                 i += 1
         else:
-            cmd.argv.append(t)
+            cmd.argv.append(t.value)
             i += 1
     return cmd, i
 
 
-def _parse_pipeline(tokens: List[str], i: int) -> Tuple[Pipeline, int]:
+def _parse_pipeline(tokens: List[Token], i: int) -> Tuple[Pipeline, int]:
     commands: List[SimpleCommand] = []
     cmd, i = _parse_simple_proper(tokens, i)
     if not cmd.argv and not cmd.redirs:
         raise ValueError("empty command")
     commands.append(cmd)
-    while i < len(tokens) and tokens[i] == '|':
+    while i < len(tokens) and tokens[i].kind == 'OP' and tokens[i].value == '|':
         i += 1
         cmd, i = _parse_simple_proper(tokens, i)
         if not cmd.argv:
@@ -484,21 +542,21 @@ def _parse_pipeline(tokens: List[str], i: int) -> Tuple[Pipeline, int]:
         commands.append(cmd)
 
     background = False
-    if i < len(tokens) and tokens[i] == '&':
+    if i < len(tokens) and tokens[i].kind == 'OP' and tokens[i].value == '&':
         background = True
         i += 1
 
     return Pipeline(commands, background), i
 
 
-def _parse_sequence(tokens: List[str]) -> List[SequenceUnit]:
+def _parse_sequence(tokens: List[Token]) -> List[SequenceUnit]:
     i = 0
     units: List[SequenceUnit] = []
     while i < len(tokens):
         pipeline, i = _parse_pipeline(tokens, i)
         next_op: Optional[str] = None
-        if i < len(tokens) and tokens[i] in (';', '&&', '||'):
-            next_op = tokens[i]
+        if i < len(tokens) and tokens[i].kind == 'OP' and tokens[i].value in (';', '&&', '||'):
+            next_op = tokens[i].value
             i += 1
         units.append(SequenceUnit(pipeline, next_op))
     return units

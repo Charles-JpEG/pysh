@@ -6,6 +6,7 @@ A project to combine python3 and posix shell, try it out if you're suffering fro
 
 ## Dependencies
 At least one posix compliant shell and python3
+- Use grep -G if your grep version does not support -P Perl regex, or install a newer GNU grep
 
 ## Usage \<Not yet implemented\>
 - Very similar to the shell you're used to, you can still cd to change directory or grep to filter output
