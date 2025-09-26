@@ -7,7 +7,7 @@ import ast
 import shutil
 import io
 from dataclasses import dataclass
-from contextlib import ExitStack, redirect_stdout, redirect_stderr
+from contextlib import ExitStack, redirect_stdout, redirect_stderr, nullcontext
 from typing import Optional, Dict, List, Tuple, Any
 import codeop
 
@@ -884,14 +884,21 @@ class _StreamMultiplexer:
 
     def write(self, data: str) -> int:
         for stream in self._streams:
-            stream.write(data)
+            try:
+                stream.write(data)
+            except Exception:
+                continue
         return len(data)
 
     def flush(self) -> None:
         for stream in self._streams:
             flush = getattr(stream, 'flush', None)
             if callable(flush):
-                flush()
+                try:
+                    flush()
+                except Exception:
+                    # Ignore flush errors when downstream stages close early.
+                    continue
 
 
 def _run_python_stage(cmd: ExpandedCommand, session: ShellSession, input_data: Optional[bytes], has_more: bool) -> Tuple[int, Optional[bytes]]:
@@ -933,7 +940,7 @@ def _run_python_stage(cmd: ExpandedCommand, session: ShellSession, input_data: O
     stdout_stream_list.extend(stdout_targets)
     if not stdout_stream_list:
         stdout_stream_list.append(sys.stdout)
-    stdout_redirect = _StreamMultiplexer(stdout_stream_list)
+    stdout_redirect: Optional[_StreamMultiplexer] = _StreamMultiplexer(stdout_stream_list) if (capture_stream is not None or stdout_targets) else None
 
     if stderr_to_stdout:
         stderr_redirect = stdout_redirect
@@ -957,7 +964,8 @@ def _run_python_stage(cmd: ExpandedCommand, session: ShellSession, input_data: O
                 old_stdin = sys.stdin
                 sys.stdin = input_stream
                 stack.callback(lambda: setattr(sys, 'stdin', old_stdin))
-            with redirect_stdout(stdout_redirect), redirect_stderr(stderr_redirect):
+            ctx_stdout = redirect_stdout(stdout_redirect) if stdout_redirect is not None else nullcontext()
+            with ctx_stdout, redirect_stderr(stderr_redirect):
                 result = try_python(cmd.python_code, session)
                 if result is None:
                     rc = 127
@@ -1056,6 +1064,7 @@ def _run_shell_group(group: List[ExpandedCommand], session: ShellSession, *, bac
                 assert proc.stdin is not None
                 proc.stdin.write(initial_input)
                 proc.stdin.close()
+                proc.stdin = None
 
             if proc.stdout is not None:
                 prev_stdout = proc.stdout
@@ -1072,7 +1081,10 @@ def _run_shell_group(group: List[ExpandedCommand], session: ShellSession, *, bac
         if procs:
             last_proc = procs[-1]
             if capture_output:
-                stdout_bytes, _ = last_proc.communicate()
+                stdout_stream = last_proc.stdout
+                if stdout_stream is not None:
+                    stdout_bytes = stdout_stream.read()
+                last_proc.wait()
             else:
                 last_proc.wait()
         exit_code = procs[-1].returncode if procs else 0
