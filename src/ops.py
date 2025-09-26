@@ -948,11 +948,22 @@ def _exec_sequence(units: List[SequenceUnit], session: ShellSession) -> int:
 def execute_line(line: str, session: ShellSession) -> int:
     # Handle multi-line Python code accumulation
     if session.in_multi_line:
-        _append_multiline_line(session, line)
+        indent_unit = session.get_indent_unit()
+        suggested_indent = indent_unit * max(session.current_indent_level, 0)
+        terminate_now = False
         if line == "":
+            terminate_now = True
+        elif line.strip() == "":
+            if suggested_indent and line == suggested_indent:
+                terminate_now = True
+            elif session.multi_line_buffer and line == session.multi_line_buffer[-1]:
+                terminate_now = True
+
+        if terminate_now:
             source = '\n'.join(session.multi_line_buffer)
+            source_for_compile = source + '\n'
             try:
-                compiled = session.command_compiler(source, symbol='single')
+                compiled = session.command_compiler(source_for_compile, symbol='single')
             except (SyntaxError, IndentationError, OverflowError, ValueError) as e:
                 session.multi_line_buffer = []
                 session.in_multi_line = False
@@ -969,6 +980,8 @@ def execute_line(line: str, session: ShellSession) -> int:
             session.in_multi_line = False
             session.current_indent_level = 0
             return rc if rc is not None else 0
+
+        _append_multiline_line(session, line)
         return 0
 
     # Check if this line starts a Python compound statement

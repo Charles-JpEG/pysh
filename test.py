@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Self-contained test runner (no external Python deps).
+Self-contained test runner (base suite has no external Python deps).
 
 Usage:
-  ./test.py           # run base tests
-  ./test.py -e        # run base + extended tests (rg, fd if installed)
-  ./test.py --extend
+    ./test.py           # run base tests
+    ./test.py -e        # run base + extended tests (rg, fd, pytest-based suites)
+    ./test.py --extend
 """
 
 from __future__ import annotations
@@ -26,6 +26,12 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from ops import ShellSession, execute_line, CommandRunner, try_python  # type: ignore
+
+
+PYTEST_SUITES = [
+    ROOT / "tests" / "test_shell_basics.py",
+    ROOT / "tests" / "interactive_loop_test.py",
+]
 
 
 # --- Color utilities ---
@@ -1406,6 +1412,24 @@ def test_compare_pysh_vs_shell_phonebook(sess: ShellSession, tmp: Path):
     assert (py_dir / 'phonebook.psv').read_text() == (sh_dir / 'phonebook.psv').read_text()
 
 
+def pytest_extended_suite(sess: ShellSession, tmp: Path):
+    try:
+        import pytest  # type: ignore
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+        raise SkipTest("pytest not installed") from exc
+
+    original_cwd = Path.cwd()
+    try:
+        os.chdir(ROOT)
+        args = ["-q", *[str(path) for path in PYTEST_SUITES]]
+        exit_code = pytest.main(args)
+    finally:
+        os.chdir(original_cwd)
+
+    if exit_code != 0:
+        raise AssertionError(f"pytest suite failed (exit code {exit_code})")
+
+
 def collect_tests(extend: bool):
     base_tests = [
         test_pwd_and_fs_ops,
@@ -1448,6 +1472,7 @@ def collect_tests(extend: bool):
         test_rg_search,
         test_rg_count,
         test_compare_pysh_vs_shell_phonebook,
+        pytest_extended_suite,
     ]
 
 

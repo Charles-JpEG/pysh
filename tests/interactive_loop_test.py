@@ -26,7 +26,7 @@ def test_for_loop_executes_after_blank_line(tester: PyshTester) -> None:
     assert second.stdout == ""
     assert second.prompt == tester.continuation_prompt + "    "
 
-    finisher = tester.run("")
+    finisher = tester.run("    ")
     assert finisher.stderr == ""
     assert finisher.prompt == tester.prompt
     assert finisher.stdout == "0\n1\n2\n"
@@ -52,7 +52,7 @@ def test_while_loop_updates_state(tester: PyshTester) -> None:
     assert body_two.stdout == ""
     assert body_two.prompt == tester.continuation_prompt + "    "
 
-    finisher = tester.run("")
+    finisher = tester.run("    ")
     assert finisher.stderr == ""
     assert finisher.prompt == tester.prompt
     assert finisher.stdout == "0\n1\n2\n"
@@ -76,7 +76,7 @@ def test_nested_loops_respect_indentation(tester: PyshTester) -> None:
     assert body.stdout == ""
     assert body.prompt == tester.continuation_prompt + "        "
 
-    finisher = tester.run("")
+    finisher = tester.run("        ")
     assert finisher.stderr == ""
     assert finisher.prompt == tester.prompt
     assert finisher.stdout == "00\n01\n10\n11\n"
@@ -89,7 +89,7 @@ def test_dedent_requires_blank_line_then_allows_follow_up(tester: PyshTester) ->
     loop_body = tester.run("print(i)")
     assert loop_body.prompt == tester.continuation_prompt + "    "
 
-    loop_result = tester.run("")
+    loop_result = tester.run("    ")
     assert loop_result.prompt == tester.prompt
     assert loop_result.stdout == "0\n1\n"
 
@@ -106,7 +106,7 @@ def test_indent_unit_is_configurable(tester: PyshTester) -> None:
     assert loop_header.prompt == tester.continuation_prompt + "  "
 
     tester.run("print(i)")
-    finished = tester.run("")
+    finished = tester.run("  ")
     assert finished.stdout == "0\n1\n"
 
     indent_value = tester.run("print(repr(__pysh_indent))")
