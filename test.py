@@ -182,6 +182,146 @@ def test_dup_redirection_spaced_forms(sess: ShellSession, tmp: Path):
     assert 'out\n' in text2 and 'err\n' in text2
 
 
+# ---- Python loop tests ----
+
+def test_for_loop_basic(sess: ShellSession, tmp: Path):
+    # Basic for loop
+    code = run_line("for i in range(3):", sess)
+    assert code == 0
+    code = run_line("    print(i)", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_for_loop_with_else(sess: ShellSession, tmp: Path):
+    # For loop with else
+    code = run_line("for i in range(2):", sess)
+    assert code == 0
+    code = run_line("    print(i)", sess)
+    assert code == 0
+    code = run_line("else:", sess)
+    assert code == 0
+    code = run_line("    print('done')", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_while_loop_basic(sess: ShellSession, tmp: Path):
+    # Basic while loop
+    code = run_line("x = 0", sess)
+    assert code == 0
+    code = run_line("while x < 3:", sess)
+    assert code == 0
+    code = run_line("    print(x)", sess)
+    assert code == 0
+    code = run_line("    x += 1", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_nested_for_loops(sess: ShellSession, tmp: Path):
+    # Nested for loops
+    code = run_line("for i in range(2):", sess)
+    assert code == 0
+    code = run_line("    for j in range(2):", sess)
+    assert code == 0
+    code = run_line("        print(i, j)", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_for_loop_list_comprehension(sess: ShellSession, tmp: Path):
+    # For loop with list comprehension
+    code = run_line("squares = [x**2 for x in range(3)]", sess)
+    assert code == 0
+    code = run_line("for sq in squares:", sess)
+    assert code == 0
+    code = run_line("    print(sq)", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_while_loop_with_break(sess: ShellSession, tmp: Path):
+    # While loop with break
+    code = run_line("x = 0", sess)
+    assert code == 0
+    code = run_line("while True:", sess)
+    assert code == 0
+    code = run_line("    print(x)", sess)
+    assert code == 0
+    code = run_line("    x += 1", sess)
+    assert code == 0
+    code = run_line("    if x >= 3:", sess)
+    assert code == 0
+    code = run_line("        break", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_for_loop_enumerate(sess: ShellSession, tmp: Path):
+    # For loop with enumerate
+    code = run_line("for idx, val in enumerate(['a', 'b']):", sess)
+    assert code == 0
+    code = run_line("    print(idx, val)", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_while_loop_continue(sess: ShellSession, tmp: Path):
+    # While loop with continue
+    code = run_line("x = 0", sess)
+    assert code == 0
+    code = run_line("while x < 5:", sess)
+    assert code == 0
+    code = run_line("    x += 1", sess)
+    assert code == 0
+    code = run_line("    if x % 2 == 0:", sess)
+    assert code == 0
+    code = run_line("        continue", sess)
+    assert code == 0
+    code = run_line("    print(x)", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_for_loop_dict_items(sess: ShellSession, tmp: Path):
+    # For loop over dict items
+    code = run_line("d = {'a': 1, 'b': 2}", sess)
+    assert code == 0
+    code = run_line("for k, v in d.items():", sess)
+    assert code == 0
+    code = run_line("    print(k, v)", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_while_loop_else(sess: ShellSession, tmp: Path):
+    # While loop with else
+    code = run_line("x = 0", sess)
+    assert code == 0
+    code = run_line("while x < 2:", sess)
+    assert code == 0
+    code = run_line("    print(x)", sess)
+    assert code == 0
+    code = run_line("    x += 1", sess)
+    assert code == 0
+    code = run_line("else:", sess)
+    assert code == 0
+    code = run_line("    print('finished')", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
 def test_find_txt_files(sess: ShellSession, tmp: Path):
     # Create structure under a dedicated root to avoid capturing output files
     search = tmp / "search"
@@ -1030,6 +1170,169 @@ def test_rg_count(sess: ShellSession, tmp: Path):
     assert run_line("rg -n 'foo' ./count.txt | wc -l > n.txt", sess) in (0, 1)
     n = int((tmp / "n.txt").read_text().strip() or "0")
     assert n == 2
+
+
+# ---- Extended loop tests with modules ----
+
+def test_for_loop_with_re(sess: ShellSession, tmp: Path):
+    import re
+    # For loop with re module
+    code = run_line("import re", sess)
+    assert code == 0
+    code = run_line("for word in ['hello', 'world', 'test']:", sess)
+    assert code == 0
+    code = run_line("    if re.match(r'^h', word):", sess)
+    assert code == 0
+    code = run_line("        print(word)", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_while_loop_with_math(sess: ShellSession, tmp: Path):
+    import math
+    # While loop with math module
+    code = run_line("import math", sess)
+    assert code == 0
+    code = run_line("x = 1", sess)
+    assert code == 0
+    code = run_line("while x <= 10:", sess)
+    assert code == 0
+    code = run_line("    print(math.sqrt(x))", sess)
+    assert code == 0
+    code = run_line("    x *= 2", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_for_loop_numpy_array(sess: ShellSession, tmp: Path):
+    # For loop with numpy (if available)
+    try:
+        import numpy as np
+    except ImportError:
+        raise SkipTest("numpy not installed")
+    code = run_line("import numpy as np", sess)
+    assert code == 0
+    code = run_line("arr = np.array([1, 2, 3])", sess)
+    assert code == 0
+    code = run_line("for val in arr:", sess)
+    assert code == 0
+    code = run_line("    print(val)", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_while_loop_collections(sess: ShellSession, tmp: Path):
+    import collections
+    # While loop with collections
+    code = run_line("import collections", sess)
+    assert code == 0
+    code = run_line("dq = collections.deque([1, 2, 3])", sess)
+    assert code == 0
+    code = run_line("while dq:", sess)
+    assert code == 0
+    code = run_line("    print(dq.popleft())", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_for_loop_itertools(sess: ShellSession, tmp: Path):
+    import itertools
+    # For loop with itertools
+    code = run_line("import itertools", sess)
+    assert code == 0
+    code = run_line("for x, y in itertools.product([1, 2], ['a', 'b']):", sess)
+    assert code == 0
+    code = run_line("    print(x, y)", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_while_loop_random(sess: ShellSession, tmp: Path):
+    import random
+    # While loop with random
+    code = run_line("import random", sess)
+    assert code == 0
+    code = run_line("count = 0", sess)
+    assert code == 0
+    code = run_line("while count < 3:", sess)
+    assert code == 0
+    code = run_line("    print(random.randint(1, 10))", sess)
+    assert code == 0
+    code = run_line("    count += 1", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_for_loop_json(sess: ShellSession, tmp: Path):
+    import json
+    # For loop with json
+    code = run_line("import json", sess)
+    assert code == 0
+    code = run_line("data = {'a': 1, 'b': 2}", sess)
+    assert code == 0
+    code = run_line("for k in json.dumps(data):", sess)
+    assert code == 0
+    code = run_line("    print(k)", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_while_loop_datetime(sess: ShellSession, tmp: Path):
+    import datetime
+    # While loop with datetime
+    code = run_line("import datetime", sess)
+    assert code == 0
+    code = run_line("now = datetime.datetime.now()", sess)
+    assert code == 0
+    code = run_line("future = now + datetime.timedelta(seconds=2)", sess)
+    assert code == 0
+    code = run_line("while datetime.datetime.now() < future:", sess)
+    assert code == 0
+    code = run_line("    pass", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_for_loop_os(sess: ShellSession, tmp: Path):
+    import os
+    # For loop with os
+    code = run_line("import os", sess)
+    assert code == 0
+    code = run_line("for f in os.listdir('.'):", sess)
+    assert code == 0
+    code = run_line("    if f.endswith('.txt'):", sess)
+    assert code == 0
+    code = run_line("        print(f)", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
+
+
+def test_while_loop_subprocess(sess: ShellSession, tmp: Path):
+    import subprocess
+    # While loop with subprocess (careful)
+    code = run_line("import subprocess", sess)
+    assert code == 0
+    code = run_line("attempts = 0", sess)
+    assert code == 0
+    code = run_line("while attempts < 2:", sess)
+    assert code == 0
+    code = run_line("    result = subprocess.run(['echo', 'test'], capture_output=True, text=True)", sess)
+    assert code == 0
+    code = run_line("    print(result.stdout.strip())", sess)
+    assert code == 0
+    code = run_line("    attempts += 1", sess)
+    assert code == 0
+    code = run_line("", sess)
+    assert code == 0
 
 
 # ---- Extended comparison test: pysh vs system shell on a multi-step pipeline ----

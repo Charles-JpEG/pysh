@@ -27,7 +27,37 @@ class ShellSession:
     - env: a dictionary snapshot of the current process environment by default.
     - shell: path to the shell binary being used by the session.
 
-    This is where future features (export, unset, aliases, functions) can update
+    This is where future features (export, unset, aliases, fu    # Handle multi-line Python code accumulation
+    if session.in_multi_line:
+        if line == "":
+            # Empty line: try to execute current buffer
+            code = '\n'.join(session.multi_line_buffer)
+            try:
+                ast.parse(code, mode='exec')
+                # Execute
+                rc = try_python(code, session)
+                session.multi_line_buffer = []
+                session.in_multi_line = False
+                return rc if rc is not None else 0
+            except SyntaxError as e:
+                # Syntax error, exit multi-line
+                sys.stderr.write(f"pysh: syntax error in multi-line code: {e}\n")
+                session.multi_line_buffer = []
+                session.in_multi_line = False
+                return 1
+        else:
+            session.multi_line_buffer.append(line)
+            code = '\n'.join(session.multi_line_buffer)
+            try:
+                ast.parse(code, mode='exec')
+                # Complete, execute
+                rc = try_python(code, session)
+                session.multi_line_buffer = []
+                session.in_multi_line = False
+                return rc if rc is not None else 0
+            except SyntaxError:
+                # Incomplete, continue
+                return 0pdate
     the environment to persist across commands.
     """
 
@@ -35,10 +65,13 @@ class ShellSession:
         self.shell: str = shell
         # String-only environment used as base for subprocesses
         self.env: Dict[str, str] = dict(os.environ) if inherit_env else {}
-    # Python variable space: holds Python objects defined by the user via assignments
-    # Does not include inherited env by default; env is merged at get_env/expansion time
+        # Python variable space: holds Python objects defined by the user via assignments
+        # Does not include inherited env by default; env is merged at get_env/expansion time
         self.py_vars: Dict[str, Any] = {}
         self.background_jobs: List[List[subprocess.Popen]] = []
+        # Multi-line Python code accumulation
+        self.multi_line_buffer: List[str] = []
+        self.in_multi_line: bool = False
 
     def get_env(self) -> Dict[str, str]:
         # Merge string env with stringified Python vars; Python vars take precedence
@@ -876,6 +909,43 @@ def _exec_sequence(units: List[SequenceUnit], session: ShellSession) -> int:
 
 
 def execute_line(line: str, session: ShellSession) -> int:
+    # Handle multi-line Python code accumulation
+    if session.in_multi_line:
+        if line.strip() == "":
+            code = '\n'.join(session.multi_line_buffer)
+            try:
+                ast.parse(code, mode='exec')
+            except SyntaxError as e:
+                # Still waiting for required input (e.g., expected indent or EOF)
+                if getattr(e, "msg", "") in {"unexpected EOF while parsing", "expected an indented block"}:
+                    return 0
+                session.multi_line_buffer = []
+                session.in_multi_line = False
+                sys.stderr.write(f"pysh: syntax error in multi-line code: {e}\n")
+                sys.stderr.flush()
+                return 1
+
+            rc = try_python(code, session)
+            session.multi_line_buffer = []
+            session.in_multi_line = False
+            return rc if rc is not None else 0
+        else:
+            session.multi_line_buffer.append(line)
+            return 0
+
+    # Check if this line starts a Python compound statement
+    stripped = line.strip()
+    try:
+        ast.parse(line, mode='exec')
+        # If it parses successfully, it's a complete statement; proceed to normal execution
+    except SyntaxError:
+        # Check if it looks like the start of a compound statement
+        if stripped.endswith(':') and stripped.split()[0] in ['for', 'while', 'if', 'def', 'class', 'with', 'try', 'async']:
+            # Start multi-line accumulation
+            session.in_multi_line = True
+            session.multi_line_buffer = [line]
+            return 0
+
     # Prepare both Python and shell views of the line
     line_py = _expand_command_substitutions(line, session, for_python=True)
     # Fast path: if this is a Python assignment, handle it first regardless of operators in substituted text

@@ -30,3 +30,7 @@ these commands are well tested and should work fine
 ### Hints:
 - All variables are managed by python, including shell env variables. Access them as if you're writing in python, or if need string repr, use $var instead
 - grep would enable Perl mode (-P) by default, use -G to use BRE
+
+
+## Loop
+- pysh loop uses python loop syntax, such as TODO

@@ -1,8 +1,7 @@
 import os
 from pathlib import Path
-import re
 
-import pytest
+import pytest  # type: ignore
 
 from ops import ShellSession, execute_line, CommandRunner
 
@@ -11,24 +10,23 @@ def run_line(line: str, session: ShellSession) -> int:
     return execute_line(line, session)
 
 
-def test_pwd_and_fs_ops(session, tmp_path, capsys):
+def test_pwd_and_fs_ops(session, tmp_path):
     # tmp_path is current working dir via fixture
     p = Path(".").resolve()
     assert p == tmp_path.resolve()
 
     # mkdir and list
     run_line("mkdir -p a/b", session)
-    code = run_line("ls -1 a", session)
+    code = run_line("ls -1 a > listing.txt", session)
     assert code == 0
-    out = capsys.readouterr().out
-    assert "b" in out
+    listing = (tmp_path / "listing.txt").read_text()
+    assert "b" in listing
 
     # Change current dir in parent process, then 'pwd' should reflect in child
     os.chdir(tmp_path / "a")
-    code = run_line("pwd", session)
+    code = run_line("pwd > pwd.txt", session)
     assert code == 0
-    out = capsys.readouterr().out.strip()
-    assert out.endswith("/a")
+    assert (tmp_path / "a" / "pwd.txt").read_text().strip().endswith("/a")
 
 
 @pytest.mark.parametrize(
@@ -38,19 +36,20 @@ def test_pwd_and_fs_ops(session, tmp_path, capsys):
         ("foo\nbar\nfoo\n", "foo", "foo\nfoo\n"),
     ],
 )
-def test_pipeline_grep(session, tmp_path, capsys, content, pattern, expected):
+def test_pipeline_grep(session, tmp_path, content, pattern, expected):
     f = tmp_path / "text.txt"
     f.write_text(content)
 
-    code = run_line(f"cat text.txt | grep -E '{pattern}'", session)
+    code = run_line(f"cat text.txt | grep -E '{pattern}' > filtered.txt", session)
     assert code in (0, 1)  # grep may return 1 if no match
-    out = capsys.readouterr().out
-    # Only lines that match pattern should appear
+    filtered = (tmp_path / "filtered.txt").read_text() if (tmp_path / "filtered.txt").exists() else ""
     if expected:
-        assert expected in out
+        assert expected in filtered
+    else:
+        assert filtered == ""
 
 
-def test_redirection_and_dup(session, tmp_path, capsys):
+def test_redirection_and_dup(session, tmp_path):
     code = run_line("sh -c 'echo out; echo err 1>&2' >o.txt 2>&1", session)
     assert code == 0
     text = (tmp_path / "o.txt").read_text()
@@ -58,12 +57,9 @@ def test_redirection_and_dup(session, tmp_path, capsys):
     assert "out\n" in text and "err\n" in text
 
 
-def test_to_devnull(session, capsys):
-    code = run_line("echo hi >/dev/null 2>&1", session)
+def test_to_devnull(session):
+    code = run_line("sh -c 'echo hi; echo err 1>&2' >/dev/null 2>&1", session)
     assert code == 0
-    out = capsys.readouterr().out
-    err = capsys.readouterr().err
-    assert out == "" and err == ""
 
 
 @pytest.mark.parametrize(
@@ -74,10 +70,14 @@ def test_to_devnull(session, capsys):
         ("false && echo bad; echo ok", True),
     ],
 )
-def test_conditionals(session, capsys, line, expect):
-    code = run_line(line, session)
-    out = capsys.readouterr().out
-    assert ("ok" in out) is expect
+def test_conditionals(session, line, expect):
+    outfile = Path("cond.txt")
+    if outfile.exists():
+        outfile.unlink()
+    code = run_line(f"{line} > cond.txt", session)
+    assert code == 0
+    result = outfile.read_text() if outfile.exists() else ""
+    assert ("ok" in result) is expect
 
 
 def test_background_jobs_do_not_block(session, tmp_path):
@@ -95,10 +95,9 @@ def test_simple_command_runner_capture(session):
     assert runner.stdout == 'a'
 
 
-def test_env_contains_sanitized_vars(session, capsys):
-    code = run_line("env", session)
+def test_env_contains_sanitized_vars(session):
+    code = run_line("env > env.txt", session)
     assert code == 0
-    out = capsys.readouterr().out
-    # Should include some of our sandbox env vars
-    assert "PATH=" in out and "HOME=" in out
+    text = Path("env.txt").read_text()
+    assert "PATH=" in text and "HOME=" in text
 

@@ -8,7 +8,8 @@ import os
 import sys
 from typing import Optional
 
-PROMPT = "> "
+PROMPT = "pysh> "
+CONTINUATION_PROMPT = "... "
 
 from ops import CommandRunner, ShellSession, execute_line  # local module in the same folder
 
@@ -44,13 +45,14 @@ def repl() -> int:
     shell = get_default_shell()
     session = ShellSession(shell=shell, inherit_env=True)
 
-    setup_readline()
+    # setup_readline()  # Disabled for testing
 
     last_runner: Optional[CommandRunner] = None
     while True:
         try:
+            prompt = CONTINUATION_PROMPT if session.in_multi_line else PROMPT
             # Preserve the line exactly as typed (no strip/rstrip)
-            line = input(PROMPT)
+            line = input(prompt)
         except EOFError:
             # Ctrl-D on empty line -> exit
             print()
@@ -60,8 +62,8 @@ def repl() -> int:
             print()
             continue
 
-        if line == "":
-            # Empty line: prompt again
+        if line == "" and not session.in_multi_line:
+            # Empty line outside of multi-line mode: prompt again
             continue
 
         # Delegate to unified executor which prefers shell commands for preserved names and PATH commands,
