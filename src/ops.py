@@ -6,6 +6,7 @@ import sys
 import ast
 import shutil
 from typing import Optional, Dict, List, Tuple, Any
+import codeop
 
 
 # ---- Token model for parsing (word vs operator) ----
@@ -22,44 +23,7 @@ class Token:
 
 
 class ShellSession:
-    """Holds session-wide shell context like environment variables.
-
-    - env: a dictionary snapshot of the current process environment by default.
-    - shell: path to the shell binary being used by the session.
-
-    This is where future features (export, unset, aliases, fu    # Handle multi-line Python code accumulation
-    if session.in_multi_line:
-        if line == "":
-            # Empty line: try to execute current buffer
-            code = '\n'.join(session.multi_line_buffer)
-            try:
-                ast.parse(code, mode='exec')
-                # Execute
-                rc = try_python(code, session)
-                session.multi_line_buffer = []
-                session.in_multi_line = False
-                return rc if rc is not None else 0
-            except SyntaxError as e:
-                # Syntax error, exit multi-line
-                sys.stderr.write(f"pysh: syntax error in multi-line code: {e}\n")
-                session.multi_line_buffer = []
-                session.in_multi_line = False
-                return 1
-        else:
-            session.multi_line_buffer.append(line)
-            code = '\n'.join(session.multi_line_buffer)
-            try:
-                ast.parse(code, mode='exec')
-                # Complete, execute
-                rc = try_python(code, session)
-                session.multi_line_buffer = []
-                session.in_multi_line = False
-                return rc if rc is not None else 0
-            except SyntaxError:
-                # Incomplete, continue
-                return 0pdate
-    the environment to persist across commands.
-    """
+    """Holds session-wide shell context like environment variables."""
 
     def __init__(self, shell: str, inherit_env: bool = True) -> None:
         self.shell: str = shell
@@ -69,9 +33,12 @@ class ShellSession:
         # Does not include inherited env by default; env is merged at get_env/expansion time
         self.py_vars: Dict[str, Any] = {}
         self.background_jobs: List[List[subprocess.Popen]] = []
-        # Multi-line Python code accumulation
+        # Multi-line Python code accumulation and indentation handling
         self.multi_line_buffer: List[str] = []
         self.in_multi_line: bool = False
+        self.command_compiler = codeop.CommandCompiler()
+        self.default_indent_unit: str = os.environ.get("PYSH_INDENT", "    ")
+        self.current_indent_level: int = 0
 
     def get_env(self) -> Dict[str, str]:
         # Merge string env with stringified Python vars; Python vars take precedence
@@ -82,6 +49,15 @@ class ShellSession:
             except Exception:
                 merged[k] = repr(v)
         return merged
+
+    def get_indent_unit(self) -> str:
+        indent_override = self.py_vars.get("__pysh_indent")
+        if isinstance(indent_override, str):
+            return indent_override
+        env_indent = self.env.get("PYSH_INDENT")
+        if isinstance(env_indent, str) and env_indent:
+            return env_indent
+        return self.default_indent_unit
 
     # --- Python variable helpers ---
     def get_var(self, name: str) -> Optional[Any]:
@@ -184,6 +160,66 @@ def _expand_vars_in_line(line: str, session: ShellSession, *, force_double: bool
         out.append(ch)
         i += 1
     return ''.join(out)
+
+
+_DEDENT_PREFIXES: Tuple[str, ...] = ("elif", "else", "except", "finally")
+
+
+def _count_indent_units(line: str, indent_unit: str) -> int:
+    if not indent_unit:
+        return 0
+    unit_len = len(indent_unit)
+    count = 0
+    pos = 0
+    while line.startswith(indent_unit, pos):
+        count += 1
+        pos += unit_len
+    return count
+
+
+def _start_multiline_block(session: ShellSession, first_line: str) -> None:
+    session.in_multi_line = True
+    session.multi_line_buffer = [first_line]
+    indent_unit = session.get_indent_unit()
+    indent_count = _count_indent_units(first_line, indent_unit)
+    stripped = first_line.strip()
+    if stripped and stripped.endswith(":") and not stripped.startswith("#"):
+        session.current_indent_level = indent_count + 1
+    else:
+        session.current_indent_level = indent_count
+    session.command_compiler = codeop.CommandCompiler()
+
+
+def _append_multiline_line(session: ShellSession, line: str) -> None:
+    indent_unit = session.get_indent_unit()
+    if not line:
+        session.multi_line_buffer.append("")
+        return
+
+    stripped = line.lstrip()
+    manual_indent = len(line) != len(stripped)
+    target_level = session.current_indent_level
+
+    if indent_unit and not manual_indent:
+        lowered = stripped
+        if any(lowered.startswith(prefix) for prefix in _DEDENT_PREFIXES) and target_level > 0:
+            target_level -= 1
+        line_to_store = indent_unit * target_level + stripped
+    else:
+        line_to_store = line
+
+    session.multi_line_buffer.append(line_to_store)
+
+    if indent_unit:
+        indent_units = _count_indent_units(line_to_store, indent_unit)
+    else:
+        indent_units = 0
+
+    stripped_line = line_to_store.strip()
+    if stripped_line and stripped_line.endswith(":") and not stripped_line.startswith("#"):
+        session.current_indent_level = indent_units + 1
+    else:
+        session.current_indent_level = indent_units
 
 
 def _expand_word(word: str, quoting: str, session: ShellSession) -> str:
@@ -311,8 +347,9 @@ def try_python(line: str, session: ShellSession) -> Optional[int]:
                 session.py_vars['_'] = val
             except Exception:
                 pass
-            sys.stdout.write(str(val) + "\n")
-            sys.stdout.flush()
+            if val is not None:
+                sys.stdout.write(str(val) + "\n")
+                sys.stdout.flush()
             return 0
         except Exception as e:
             sys.stderr.write(f"pysh(py-eval): {e}\n")
@@ -911,27 +948,28 @@ def _exec_sequence(units: List[SequenceUnit], session: ShellSession) -> int:
 def execute_line(line: str, session: ShellSession) -> int:
     # Handle multi-line Python code accumulation
     if session.in_multi_line:
-        if line.strip() == "":
-            code = '\n'.join(session.multi_line_buffer)
+        _append_multiline_line(session, line)
+        if line == "":
+            source = '\n'.join(session.multi_line_buffer)
             try:
-                ast.parse(code, mode='exec')
-            except SyntaxError as e:
-                # Still waiting for required input (e.g., expected indent or EOF)
-                if getattr(e, "msg", "") in {"unexpected EOF while parsing", "expected an indented block"}:
-                    return 0
+                compiled = session.command_compiler(source, symbol='single')
+            except (SyntaxError, IndentationError, OverflowError, ValueError) as e:
                 session.multi_line_buffer = []
                 session.in_multi_line = False
+                session.current_indent_level = 0
                 sys.stderr.write(f"pysh: syntax error in multi-line code: {e}\n")
                 sys.stderr.flush()
                 return 1
 
-            rc = try_python(code, session)
+            if compiled is None:
+                return 0
+
+            rc = try_python(source, session)
             session.multi_line_buffer = []
             session.in_multi_line = False
+            session.current_indent_level = 0
             return rc if rc is not None else 0
-        else:
-            session.multi_line_buffer.append(line)
-            return 0
+        return 0
 
     # Check if this line starts a Python compound statement
     stripped = line.strip()
@@ -942,8 +980,7 @@ def execute_line(line: str, session: ShellSession) -> int:
         # Check if it looks like the start of a compound statement
         if stripped.endswith(':') and stripped.split()[0] in ['for', 'while', 'if', 'def', 'class', 'with', 'try', 'async']:
             # Start multi-line accumulation
-            session.in_multi_line = True
-            session.multi_line_buffer = [line]
+            _start_multiline_block(session, line)
             return 0
 
     # Prepare both Python and shell views of the line
