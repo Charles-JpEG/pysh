@@ -5,6 +5,9 @@ import subprocess
 import sys
 import ast
 import shutil
+import io
+from dataclasses import dataclass
+from contextlib import ExitStack, redirect_stdout, redirect_stderr, nullcontext
 from typing import Optional, Dict, List, Tuple, Any
 import codeop
 
@@ -456,6 +459,14 @@ class SimpleCommand:
         self.redirs: List[Redirection] = []
 
 
+@dataclass
+class ExpandedCommand:
+    argv: List[str]
+    redirs: List[Redirection]
+    is_python: bool
+    python_code: Optional[str] = None
+
+
 class Pipeline:
     def __init__(self, commands: List[SimpleCommand], background: bool = False) -> None:
         self.commands = commands
@@ -823,106 +834,338 @@ def _apply_redirections(cmd: SimpleCommand) -> Tuple[Optional[int], Optional[int
     return stdin_fd, stdout_fd, stderr_fd, closers
 
 
-def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:
-    # Handle built-in 'cd' when it's not part of a pipeline and without redirections
-    if len(p.commands) == 1:
-        cmd0 = p.commands[0]
-        if cmd0.argv and cmd0.argv[0][0] == 'cd' and not cmd0.redirs:
-            # cd [dir]
-            target = None
-            if len(cmd0.argv) == 1:
-                target = session.get_env().get('HOME') or os.path.expanduser('~')
-            else:
-                target = _expand_word(cmd0.argv[1][0], cmd0.argv[1][1], session)
+def _reconstruct_python_source(argv_tokens: List[Tuple[str, str]]) -> str:
+    parts: List[str] = []
+    for value, quoting in argv_tokens:
+        if value.startswith("\x00S"):
+            parts.append("'" + value[2:] + "'")
+        elif value.startswith("\x00D"):
+            parts.append('"' + value[2:] + '"')
+        else:
+            parts.append(value)
+    return ' '.join(parts)
+
+
+def _should_treat_as_python(shell_argv: List[str], python_code: str, session: ShellSession) -> bool:
+    if not shell_argv:
+        return bool(python_code.strip())
+    cmd_name = shell_argv[0]
+    if cmd_name == 'cd' or cmd_name in GUARANTEED_COMMANDS:
+        return False
+    env_path = session.get_env().get('PATH', os.defpath)
+    if shutil.which(cmd_name, mode=os.F_OK | os.X_OK, path=env_path):
+        return False
+    if not python_code.strip():
+        return False
+    try:
+        ast.parse(python_code, mode='exec')
+        return True
+    except SyntaxError:
+        return False
+
+
+def _expand_command_for_stage(cmd: SimpleCommand, session: ShellSession) -> ExpandedCommand:
+    shell_argv = [_expand_word(value, quoting, session) for value, quoting in cmd.argv]
+    redirs: List[Redirection] = []
+    for r in cmd.redirs:
+        target = r.target
+        if isinstance(target, str):
+            target = _expand_word(target, 'unquoted', session)
+        redirs.append(Redirection(r.fd, r.op, target))
+    python_source_raw = _reconstruct_python_source(cmd.argv).strip()
+    python_code = _expand_command_substitutions(python_source_raw, session, for_python=True) if python_source_raw else ""
+    is_python = _should_treat_as_python(shell_argv, python_code, session)
+    return ExpandedCommand(argv=shell_argv, redirs=redirs, is_python=is_python, python_code=python_code if is_python else None)
+
+
+class _StreamMultiplexer:
+    def __init__(self, streams: List[Any]):
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
             try:
-                os.chdir(target)
-                # Update PWD in both environment and python vars to keep them in sync
-                newpwd = os.getcwd()
-                session.env['PWD'] = newpwd
-                session.py_vars['PWD'] = newpwd
-                return 0
-            except Exception as e:
-                sys.stderr.write(f"pysh: cd: {e}\n")
-                sys.stderr.flush()
-                return 1
+                stream.write(data)
+            except Exception:
+                continue
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            flush = getattr(stream, 'flush', None)
+            if callable(flush):
+                try:
+                    flush()
+                except Exception:
+                    # Ignore flush errors when downstream stages close early.
+                    continue
+
+
+def _run_python_stage(cmd: ExpandedCommand, session: ShellSession, input_data: Optional[bytes], has_more: bool) -> Tuple[int, Optional[bytes]]:
+    assert cmd.python_code is not None
+    encoding = 'utf-8'
+    stdin_stream: Optional[io.TextIOBase] = None
+    stdout_targets: List[io.TextIOBase] = []
+    stderr_target: Optional[io.TextIOBase] = None
+    stderr_to_stdout = False
+    opened_streams: List[io.TextIOBase] = []
+
+    for redir in cmd.redirs:
+        if redir.op == '<':
+            if redir.fd not in (0,):
+                raise ValueError("unsupported fd for input redirection in python stage")
+            f = open(str(redir.target), 'r', encoding=encoding, errors='replace')
+            stdin_stream = f
+            opened_streams.append(f)
+        elif redir.op in ('>', '>>'):
+            mode = 'w' if redir.op == '>' else 'a'
+            f = open(str(redir.target), mode, encoding=encoding, errors='replace')
+            opened_streams.append(f)
+            if redir.fd == 1:
+                stdout_targets.append(f)
+            elif redir.fd == 2:
+                stderr_target = f
+            else:
+                f.close()
+                raise ValueError("unsupported fd for python redirection")
+        elif redir.op == 'dup' and redir.fd == 2 and isinstance(redir.target, int) and redir.target == 1:
+            stderr_to_stdout = True
+        else:
+            raise ValueError(f"unsupported redirection for python stage: {redir.op}")
+
+    capture_stream: Optional[io.StringIO] = io.StringIO() if has_more else None
+    stdout_stream_list: List[Any] = []
+    if capture_stream is not None:
+        stdout_stream_list.append(capture_stream)
+    stdout_stream_list.extend(stdout_targets)
+    if not stdout_stream_list:
+        stdout_stream_list.append(sys.stdout)
+    stdout_redirect: Optional[_StreamMultiplexer] = _StreamMultiplexer(stdout_stream_list) if (capture_stream is not None or stdout_targets) else None
+
+    if stderr_to_stdout:
+        stderr_redirect = stdout_redirect
+    else:
+        if stderr_target is None:
+            stderr_target = sys.stderr
+        stderr_redirect = _StreamMultiplexer([stderr_target])
+
+    input_stream: Optional[io.TextIOBase]
+    if stdin_stream is not None:
+        input_stream = stdin_stream
+    elif input_data is not None:
+        input_stream = io.StringIO(input_data.decode(encoding, errors='replace'))
+    else:
+        input_stream = None
+
+    rc = 0
+    try:
+        with ExitStack() as stack:
+            if input_stream is not None:
+                old_stdin = sys.stdin
+                sys.stdin = input_stream
+                stack.callback(lambda: setattr(sys, 'stdin', old_stdin))
+            ctx_stdout = redirect_stdout(stdout_redirect) if stdout_redirect is not None else nullcontext()
+            with ctx_stdout, redirect_stderr(stderr_redirect):
+                result = try_python(cmd.python_code, session)
+                if result is None:
+                    rc = 127
+                else:
+                    rc = result
+    finally:
+        for stream in opened_streams:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    output_bytes: Optional[bytes] = None
+    if capture_stream is not None:
+        output_bytes = capture_stream.getvalue().encode(encoding)
+    return rc, output_bytes
+
+
+def _run_shell_group(group: List[ExpandedCommand], session: ShellSession, *, background: bool, initial_input: Optional[bytes], capture_output: bool) -> Tuple[int, Optional[bytes], List[subprocess.Popen]]:
+    if not group:
+        return 0, initial_input, []
+
+    if background and capture_output:
+        raise ValueError("cannot capture output when running in background")
+
+    if len(group) == 1 and group[0].argv and group[0].argv[0] == 'cd' and not capture_output and initial_input is None and not background:
+        target = None
+        if len(group[0].argv) == 1:
+            target = session.get_env().get('HOME') or os.path.expanduser('~')
+        else:
+            target = group[0].argv[1]
+        try:
+            os.chdir(target)
+            newpwd = os.getcwd()
+            session.env['PWD'] = newpwd
+            session.py_vars['PWD'] = newpwd
+            return 0, None, []
+        except Exception as e:
+            sys.stderr.write(f"pysh: cd: {e}\n")
+            sys.stderr.flush()
+            return 1, None, []
 
     procs: List[subprocess.Popen] = []
+    open_handles: List[Any] = []
     prev_stdout = None
-    open_handles: List = []
     try:
-        for idx, cmd in enumerate(p.commands):
-            # Expand argv and redirection targets per word
-            local_argv = [_expand_word(value, quoting, session) for value, quoting in cmd.argv]
-            # Apply default grep engine tweak on expanded argv
-            if local_argv:
-                prog_name = os.path.basename(local_argv[0])
-            else:
-                prog_name = ''
-
-            # Expand redirection targets
-            for r in cmd.redirs:
-                if r.op in ('>', '>>', '<') and isinstance(r.target, str):
-                    r.target = _expand_word(r.target, 'unquoted', session)
-
-            stdin_fd, stdout_fd, stderr_fd, closers = _apply_redirections(cmd)
-            open_handles.extend(closers)
+        for idx, info in enumerate(group):
+            cmd_stub = SimpleCommand(argv=[])
+            cmd_stub.redirs = [Redirection(r.fd, r.op, r.target) for r in info.redirs]
+            stdin_fd, stdout_fd, stderr_fd, closers = _apply_redirections(cmd_stub)
             open_handles.extend(closers)
 
-            stdin = prev_stdout if prev_stdout is not None else (stdin_fd if stdin_fd is not None else None)
-            # For intermediate commands in a pipeline, stdout must be a PIPE unless explicitly redirected
-            if idx < len(p.commands) - 1:
-                stdout = subprocess.PIPE
-            else:
-                stdout = stdout_fd if stdout_fd is not None else None
+            if not info.argv:
+                raise ValueError("empty command in pipeline")
 
-            stderr = stderr_fd if stderr_fd is not None else None
-
-            # Spec tweak: default grep engine is PCRE (-P) unless an engine flag is provided
+            local_argv = list(info.argv)
+            prog_name = os.path.basename(local_argv[0]) if local_argv else ''
             if prog_name == 'grep':
                 engine_flags = {'-E', '--extended-regexp', '-F', '--fixed-strings', '-G', '--basic-regexp', '-P', '--perl-regexp'}
                 if not any(a in engine_flags for a in local_argv[1:]):
                     local_argv.insert(1, '-P')
 
-            proc = subprocess.Popen(
-                local_argv,
-                stdin=stdin,
-                stdout=stdout,
-                stderr=stderr,
-                env=session.get_env(),
-            )
+            use_initial_input = idx == 0 and initial_input is not None
+            if use_initial_input and stdin_fd is not None:
+                sys.stderr.write("pysh: cannot combine pipeline input with stdin redirection\n")
+                sys.stderr.flush()
+                return 1, None, []
+
+            if use_initial_input:
+                stdin = subprocess.PIPE
+            else:
+                stdin = prev_stdout if prev_stdout is not None else (stdin_fd if stdin_fd is not None else None)
+
+            if idx < len(group) - 1:
+                stdout = subprocess.PIPE
+            else:
+                if capture_output:
+                    if stdout_fd is not None:
+                        sys.stderr.write("pysh: cannot redirect stdout when piping to python stage\n")
+                        sys.stderr.flush()
+                        return 1, None, []
+                    stdout = subprocess.PIPE
+                else:
+                    stdout = stdout_fd if stdout_fd is not None else None
+
+            stderr = stderr_fd if stderr_fd is not None else None
+
+            proc = subprocess.Popen(local_argv, stdin=stdin, stdout=stdout, stderr=stderr, env=session.get_env())
             procs.append(proc)
 
-            # If we created a pipe, hook next command's stdin to this stdout
+            if use_initial_input:
+                assert proc.stdin is not None
+                proc.stdin.write(initial_input)
+                proc.stdin.close()
+                proc.stdin = None
+
             if proc.stdout is not None:
                 prev_stdout = proc.stdout
             else:
                 prev_stdout = None
 
-        if p.background:
+        if background:
             session.background_jobs.append(procs)
-            return 0
+            return 0, None, procs
 
-        # Foreground: wait for all; exit code from last
-        exit_code = 0
+        stdout_bytes: Optional[bytes] = None
         for proc in procs[:-1]:
             proc.wait()
         if procs:
-            exit_code = procs[-1].wait()
-        return exit_code
+            last_proc = procs[-1]
+            if capture_output:
+                stdout_stream = last_proc.stdout
+                if stdout_stream is not None:
+                    stdout_bytes = stdout_stream.read()
+                last_proc.wait()
+            else:
+                last_proc.wait()
+        exit_code = procs[-1].returncode if procs else 0
+        return exit_code, stdout_bytes, procs
     finally:
-        # Close any open file handles we created for redirections
         for h in open_handles:
             try:
                 h.close()
             except Exception:
                 pass
-        # Close any pipe endpoints we inherited in parent
         for proc in procs:
             if proc.stdout is not None:
                 try:
                     proc.stdout.close()
                 except Exception:
                     pass
+
+def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:
+    total = len(p.commands)
+    if total == 0:
+        return 0
+
+    idx = 0
+    last_exit = 0
+    input_data: Optional[bytes] = None
+    cached: Optional[ExpandedCommand] = None
+
+    while idx < total:
+        if cached is not None:
+            current = cached
+            cached = None
+        else:
+            current = _expand_command_for_stage(p.commands[idx], session)
+
+        if current.is_python:
+            if p.background:
+                sys.stderr.write("pysh: python stages cannot run in background pipelines\n")
+                sys.stderr.flush()
+                return 1
+
+            has_more = (idx + 1 < total)
+            rc, output_data = _run_python_stage(current, session, input_data, has_more)
+            last_exit = rc
+            input_data = output_data
+            idx += 1
+            continue
+
+        shell_group: List[ExpandedCommand] = [current]
+        idx += 1
+        while idx < total:
+            if cached is not None:
+                next_expanded = cached
+                cached = None
+            else:
+                next_expanded = _expand_command_for_stage(p.commands[idx], session)
+            if next_expanded.is_python:
+                cached = next_expanded
+                break
+            shell_group.append(next_expanded)
+            idx += 1
+
+        has_more = cached is not None or idx < total
+        if p.background and has_more:
+            sys.stderr.write("pysh: background pipelines cannot mix python stages\n")
+            sys.stderr.flush()
+            return 1
+
+        rc, output_data, _ = _run_shell_group(
+            shell_group,
+            session,
+            background=p.background and not has_more,
+            initial_input=input_data,
+            capture_output=has_more,
+        )
+        last_exit = rc
+        input_data = output_data if has_more else None
+
+        if p.background and not has_more:
+            return 0
+
+    return last_exit
 
 
 def _exec_sequence(units: List[SequenceUnit], session: ShellSession) -> int:

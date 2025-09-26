@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import shutil
 import sys
@@ -24,6 +25,8 @@ ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+from contextlib import redirect_stderr
 
 from ops import ShellSession, execute_line, CommandRunner, try_python  # type: ignore
 
@@ -99,6 +102,14 @@ def test_pipeline_grep(sess: ShellSession, tmp: Path):
     assert code in (0, 1)
 
 
+def test_python_pipeline_into_shell(sess: ShellSession, tmp: Path):
+    assert run_line("ENV = {'COLOR': 'blue', 'OTHER': 'green'}", sess) == 0
+    rc = run_line("print(ENV) | grep COLOR > env_hit.txt", sess)
+    assert rc in (0, 1)
+    text = (tmp / "env_hit.txt").read_text()
+    assert "COLOR" in text and "blue" in text
+
+
 def test_redirection_and_dup(sess: ShellSession, tmp: Path):
     code = run_line("sh -c 'echo out; echo err 1>&2' >o.txt 2>&1", sess)
     assert code == 0
@@ -157,7 +168,7 @@ def test_quoted_pipe_literal(sess: ShellSession, tmp: Path):
 
 def test_escaped_pipe_literal(sess: ShellSession, tmp: Path):
     # Escaped pipe in unquoted context should be literal
-    assert run_line("echo a\|b > ep.txt", sess) in (0, 1)
+    assert run_line(r"echo a\|b > ep.txt", sess) in (0, 1)
     out = (tmp / 'ep.txt').read_text().strip()
     assert out == 'a|b'
 
@@ -466,6 +477,27 @@ def _run_and_read(line: str, out: Path, sess: ShellSession) -> str:
     return _read(out)
 
 
+def _run_and_capture_err(line: str, sess: ShellSession) -> tuple[int, str]:
+    with tempfile.NamedTemporaryFile(prefix="pysh-err-", delete=False) as tmp_err:
+        err_path = Path(tmp_err.name)
+        err_fd = tmp_err.fileno()
+        sys.stderr.flush()
+        saved_fd = os.dup(sys.stderr.fileno())
+        try:
+            os.dup2(err_fd, sys.stderr.fileno())
+            rc = run_line(line, sess)
+            sys.stderr.flush()
+        finally:
+            os.dup2(saved_fd, sys.stderr.fileno())
+            os.close(saved_fd)
+        tmp_err.flush()
+    try:
+        text = err_path.read_text().strip()
+    finally:
+        err_path.unlink(missing_ok=True)
+    return rc, text
+
+
 def build_guaranteed_command_tests():
     tests = []
 
@@ -491,14 +523,15 @@ def build_guaranteed_command_tests():
 
     def cd_4(sess: ShellSession, tmp: Path):
         p = tmp / 'abs'
-        p.mkdir()
+        p.mkdir(exist_ok=True)
         assert run_line(f"cd {p}", sess) == 0
         out = _run_and_read("pwd", tmp / 'o.txt', sess).strip()
         assert out == str(p)
 
     def cd_5(sess: ShellSession, tmp: Path):
-        rc = run_line("cd no_such_dir", sess)
+        rc, err = _run_and_capture_err("cd no_such_dir", sess)
         assert rc != 0
+        assert 'no_such_dir' in err
 
     tests += [cd_1, cd_2, cd_3, cd_4, cd_5]
 
@@ -526,14 +559,15 @@ def build_guaranteed_command_tests():
 
     def ls_4(sess: ShellSession, tmp: Path):
         (tmp / '.dot').write_text('h')
-        rc = run_line("ls -a | grep \.dot > o.txt", sess)
+        rc = run_line(r"ls -a | grep \.dot > o.txt", sess)
         assert rc in (0, 1)
         out = _read(tmp / 'o.txt')
         assert '.dot' in out
 
     def ls_5(sess: ShellSession, tmp: Path):
-        rc = run_line("ls no_such_file", sess)
+        rc, err = _run_and_capture_err("ls no_such_file", sess)
         assert rc != 0
+        assert 'no_such_file' in err
 
     tests += [ls_1, ls_2, ls_3, ls_4, ls_5]
 
@@ -580,7 +614,9 @@ def build_guaranteed_command_tests():
 
     def mkdir_3(sess: ShellSession, tmp: Path):
         # mkdir existing without -p should fail
-        assert run_line("mkdir dmk", sess) != 0
+        rc, err = _run_and_capture_err("mkdir dmk", sess)
+        assert rc != 0
+        assert 'File exists' in err or 'file exists' in err.lower()
 
     def mkdir_4(sess: ShellSession, tmp: Path):
         # create with absolute path
@@ -605,7 +641,9 @@ def build_guaranteed_command_tests():
         d = tmp / 'drm2'
         (d / 'x').parent.mkdir(parents=True, exist_ok=True)
         (d / 'x').write_text('1')
-        assert run_line("rmdir drm2", sess) != 0
+        rc, err = _run_and_capture_err("rmdir drm2", sess)
+        assert rc != 0
+        assert 'Directory not empty' in err or 'directory not empty' in err.lower()
 
     def rmdir_3(sess: ShellSession, tmp: Path):
         d = tmp / 'drm3/a/b'
@@ -615,7 +653,9 @@ def build_guaranteed_command_tests():
 
     def rmdir_4(sess: ShellSession, tmp: Path):
         # removing non-existent dir should fail
-        assert run_line("rmdir no_such", sess) != 0
+        rc, err = _run_and_capture_err("rmdir no_such", sess)
+        assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     def rmdir_5(sess: ShellSession, tmp: Path):
         # remove nested after clearing
@@ -647,7 +687,9 @@ def build_guaranteed_command_tests():
         assert not f1.exists() and not f2.exists()
 
     def rm_4(sess: ShellSession, tmp: Path):
-        assert run_line("rm no_such", sess) != 0
+        rc, err = _run_and_capture_err("rm no_such", sess)
+        assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     def rm_5(sess: ShellSession, tmp: Path):
         d = tmp / 'rdr'
@@ -685,7 +727,9 @@ def build_guaranteed_command_tests():
 
     def cp_5(sess: ShellSession, tmp: Path):
         # missing source
-        assert run_line("cp nofile target", sess) != 0
+        rc, err = _run_and_capture_err("cp nofile target", sess)
+        assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     tests += [cp_1, cp_2, cp_3, cp_4, cp_5]
 
@@ -710,7 +754,9 @@ def build_guaranteed_command_tests():
 
     def mv_4(sess: ShellSession, tmp: Path):
         # missing source
-        assert run_line("mv nofile target", sess) != 0
+        rc, err = _run_and_capture_err("mv nofile target", sess)
+        assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     def mv_5(sess: ShellSession, tmp: Path):
         # move directory
@@ -797,7 +843,7 @@ def build_guaranteed_command_tests():
         assert out == 'a b'
 
     def echo_3(sess: ShellSession, tmp: Path):
-        out = _run_and_read("echo \$HOME", tmp / 'o.txt', sess).strip()
+        out = _run_and_read(r"echo \$HOME", tmp / 'o.txt', sess).strip()
         assert out == '$HOME'
 
     def echo_4(sess: ShellSession, tmp: Path):
@@ -830,8 +876,9 @@ def build_guaranteed_command_tests():
         assert out in ('1\n2\n', '1\n2', '12')
 
     def cat_4(sess: ShellSession, tmp: Path):
-        rc = run_line("cat no_such", sess)
+        rc, err = _run_and_capture_err("cat no_such", sess)
         assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     def cat_5(sess: ShellSession, tmp: Path):
         out = _run_and_read("printf 'a\n' | cat", tmp / 'o.txt', sess)
@@ -858,8 +905,9 @@ def build_guaranteed_command_tests():
         assert out.splitlines()[0] == '1'
 
     def head_5(sess: ShellSession, tmp: Path):
-        rc = run_line("head no_such", sess)
+        rc, err = _run_and_capture_err("head no_such", sess)
         assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     tests += [head_1, head_2, head_3, head_4, head_5]
 
@@ -882,8 +930,9 @@ def build_guaranteed_command_tests():
         assert out.splitlines()[-1] == '10'
 
     def tail_5(sess: ShellSession, tmp: Path):
-        rc = run_line("tail no_such", sess)
+        rc, err = _run_and_capture_err("tail no_such", sess)
         assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     tests += [tail_1, tail_2, tail_3, tail_4, tail_5]
 
@@ -904,12 +953,13 @@ def build_guaranteed_command_tests():
         assert int(out) == len(data.encode())
 
     def wc_4(sess: ShellSession, tmp: Path):
-        out = _run_and_read("printf '' | wc -c", tmp / 'o.txt', sess).strip()
+        out = _run_and_read("printf '%s' '' | wc -c", tmp / 'o.txt', sess).strip()
         assert int(out) == 0
 
     def wc_5(sess: ShellSession, tmp: Path):
-        rc = run_line("wc no_such", sess)
+        rc, err = _run_and_capture_err("wc no_such", sess)
         assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     tests += [wc_1, wc_2, wc_3, wc_4, wc_5]
 
@@ -933,8 +983,9 @@ def build_guaranteed_command_tests():
         assert 'aba' in out
 
     def grep_5(sess: ShellSession, tmp: Path):
-        rc = run_line("grep -F 'x' no_such", sess)
+        rc, err = _run_and_capture_err("grep -F 'x' no_such", sess)
         assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     tests += [grep_1, grep_2, grep_3, grep_4, grep_5]
 
@@ -953,8 +1004,9 @@ def build_guaranteed_command_tests():
         assert out == 'x\n'
 
     def sort_4(sess: ShellSession, tmp: Path):
-        rc = run_line("sort no_such", sess)
+        rc, err = _run_and_capture_err("sort no_such", sess)
         assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     def sort_5(sess: ShellSession, tmp: Path):
         (tmp / 's2').write_text('b\na\n')
@@ -978,8 +1030,9 @@ def build_guaranteed_command_tests():
         assert out.splitlines() == ['a', 'b']
 
     def uniq_4(sess: ShellSession, tmp: Path):
-        rc = run_line("uniq no_such", sess)
+        rc, err = _run_and_capture_err("uniq no_such", sess)
         assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     def uniq_5(sess: ShellSession, tmp: Path):
         (tmp / 'uu').write_text('a\nA\n')
@@ -1003,8 +1056,9 @@ def build_guaranteed_command_tests():
         assert out.strip() == 'b'
 
     def cut_4(sess: ShellSession, tmp: Path):
-        rc = run_line("cut -d, -f2 no_such", sess)
+        rc, err = _run_and_capture_err("cut -d, -f2 no_such", sess)
         assert rc != 0
+        assert 'No such file or directory' in err or 'no such file or directory' in err.lower()
 
     def cut_5(sess: ShellSession, tmp: Path):
         (tmp / 'c2').write_text('a,b,c\n1,2,3\n')
@@ -1099,8 +1153,9 @@ def build_guaranteed_command_tests():
         assert out.strip() != ''
 
     def which_3(sess: ShellSession, tmp: Path):
-        rc = run_line("which no_such > o.txt", sess)
+        rc, err = _run_and_capture_err("which no_such > o.txt", sess)
         assert rc != 0
+        assert 'no_such' in err.lower()
 
     def which_4(sess: ShellSession, tmp: Path):
         rc = run_line("which ls > o.txt", sess)
@@ -1136,6 +1191,235 @@ def build_guaranteed_command_tests():
         assert 'SHELL=' in out
 
     tests += [env_1, env_2, env_3, env_4, env_5]
+
+    return tests
+
+
+def build_hybrid_command_tests():
+    scenarios = [
+        {
+            "name": "hybrid_python_pipe_wc_chars",
+            "py_vars": {"HY_ALPHA": "alpha"},
+            "command": "print(HY_ALPHA) | wc -c > hy_wc_chars.txt",
+            "check": lambda tmp, sess: int((tmp / 'hy_wc_chars.txt').read_text().strip()) == 6,
+        },
+        {
+            "name": "hybrid_python_pipe_wc_lines",
+            "py_vars": {"HY_TWO_LINES": "line1\nline2"},
+            "command": "print(HY_TWO_LINES) | wc -l > hy_wc_lines.txt",
+            "check": lambda tmp, sess: int((tmp / 'hy_wc_lines.txt').read_text().strip()) == 2,
+        },
+        {
+            "name": "hybrid_python_pipe_wc_words",
+            "py_vars": {"HY_WORDS": "one two three"},
+            "command": "print(HY_WORDS) | wc -w > hy_wc_words.txt",
+            "check": lambda tmp, sess: int((tmp / 'hy_wc_words.txt').read_text().strip()) == 3,
+        },
+        {
+            "name": "hybrid_python_pipe_grep_match",
+            "py_vars": {"HY_FOOBAR": "foo\nbar"},
+            "command": "print(HY_FOOBAR) | grep bar > hy_grep_hit.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_grep_hit.txt').read_text() == 'bar\n',
+        },
+        {
+            "name": "hybrid_python_pipe_grep_no_match",
+            "py_vars": {"HY_FOO": "foo"},
+            "command": "print(HY_FOO) | grep bar > hy_grep_miss.txt",
+            "rc": (1,),
+            "check": lambda tmp, sess: (tmp / 'hy_grep_miss.txt').read_text() == '',
+        },
+        {
+            "name": "hybrid_python_pipe_sort_alpha",
+            "py_vars": {"HY_SORT_ALPHA": "b\na\nc"},
+            "command": "print(HY_SORT_ALPHA) | sort > hy_sort.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_sort.txt').read_text() == 'a\nb\nc\n',
+        },
+        {
+            "name": "hybrid_python_pipe_sort_reverse",
+            "py_vars": {"HY_SORT_NUMS": "3\n1\n2"},
+            "command": "print(HY_SORT_NUMS) | sort -r > hy_sort_desc.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_sort_desc.txt').read_text() == '3\n2\n1\n',
+        },
+        {
+            "name": "hybrid_python_pipe_uniq_count",
+            "py_vars": {"HY_UNIQ": "x\nx\ny"},
+            "command": "print(HY_UNIQ) | uniq -c > hy_uniq.txt",
+            "check": lambda tmp, sess: '2 x' in (tmp / 'hy_uniq.txt').read_text(),
+        },
+        {
+            "name": "hybrid_python_pipe_cut_field",
+            "py_vars": {"HY_FIELDS": "name,age,city"},
+            "command": "print(HY_FIELDS) | cut -d',' -f2 > hy_cut.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_cut.txt').read_text() == 'age\n',
+        },
+        {
+            "name": "hybrid_python_pipe_head_first",
+            "py_vars": {"HY_ROWS": "l0\nl1\nl2"},
+            "command": "print(HY_ROWS) | head -n1 > hy_head.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_head.txt').read_text() == 'l0\n',
+        },
+        {
+            "name": "hybrid_python_pipe_tail_last",
+            "py_vars": {"HY_ROWS": "l0\nl1\nl2"},
+            "command": "print(HY_ROWS) | tail -n1 > hy_tail.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_tail.txt').read_text() == 'l2\n',
+        },
+        {
+            "name": "hybrid_python_pipe_three_stage_min",
+            "py_vars": {"HY_SORT_ALPHA": "b\na\nc"},
+            "command": "print(HY_SORT_ALPHA) | sort | head -n1 > hy_min.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_min.txt').read_text() == 'a\n',
+        },
+        {
+            "name": "hybrid_python_pipe_three_stage_max",
+            "py_vars": {"HY_SORT_ALPHA": "b\na\nc"},
+            "command": "print(HY_SORT_ALPHA) | sort | tail -n1 > hy_max.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_max.txt').read_text() == 'c\n',
+        },
+        {
+            "name": "hybrid_shell_to_python_upper",
+            "prepare": lambda sess, tmp: (tmp / 'hy_colors.txt').write_text('red\nGreen\n'),
+            "command": "cat hy_colors.txt | print(SYS.stdin.read().upper().strip()) > hy_upper.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_upper.txt').read_text() == 'RED\nGREEN\n',
+        },
+        {
+            "name": "hybrid_shell_python_shell_chain",
+            "py_vars": {"HY_ALPHA_BETA": "alpha\nbeta"},
+            "command": "print(HY_ALPHA_BETA) | grep beta | print(SYS.stdin.read().strip().upper()) | wc -c > hy_chain_len.txt",
+            "check": lambda tmp, sess: int((tmp / 'hy_chain_len.txt').read_text().strip()) == 5,
+        },
+        {
+            "name": "hybrid_python_python_shell_chain",
+            "py_vars": {"HY_ONE_TWO": "one two"},
+            "command": "print(HY_ONE_TWO) | print(SYS.stdin.read().strip().replace(chr(32), chr(45))) | wc -m > hy_hyphen_len.txt",
+            "check": lambda tmp, sess: int((tmp / 'hy_hyphen_len.txt').read_text().strip()) == 8,
+        },
+        {
+            "name": "hybrid_shell_python_count_lines",
+            "prepare": lambda sess, tmp: (tmp / 'hy_numbers.txt').write_text('0\n1\n2\n3\n4\n'),
+            "command": "cat hy_numbers.txt | print(len(SYS.stdin.read().splitlines())) > hy_count.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_count.txt').read_text() == '5\n',
+        },
+        {
+            "name": "hybrid_env_echo_python_wc",
+            "env": {"PATH_LABEL": "pysh"},
+            "command": "echo $PATH_LABEL | print(SYS.stdin.read().strip()) | wc -c > hy_label_len.txt",
+            "check": lambda tmp, sess: int((tmp / 'hy_label_len.txt').read_text().strip()) == 5,
+        },
+        {
+            "name": "hybrid_python_redirection_to_file",
+            "py_vars": {"HY_DIRECT": "direct to file"},
+            "command": "print(HY_DIRECT) > hy_direct.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_direct.txt').read_text() == 'direct to file\n',
+        },
+        {
+            "name": "hybrid_python_append_to_file",
+            "py_vars": {"HY_APPEND": "second"},
+            "prepare": lambda sess, tmp: (tmp / 'hy_log.txt').write_text('first\n'),
+            "command": "print(HY_APPEND) >> hy_log.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_log.txt').read_text() == 'first\nsecond\n',
+        },
+        {
+            "name": "hybrid_python_input_redirection_sum",
+            "prepare": lambda sess, tmp: (tmp / 'hy_nums.txt').write_text('1\n2\n3\n'),
+            "command": "cat hy_nums.txt | print(sum(int(line) for line in SYS.stdin if line.strip())) > hy_total.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_total.txt').read_text() == '6\n',
+        },
+        {
+            "name": "hybrid_env_filter_python",
+            "env": {"PYSH_SAMPLE": "value", "PYSH_EXTRA": "alt"},
+            "command": "env | print(chr(10).join(sorted(line.split(chr(61))[0] for line in SYS.stdin if line.startswith(chr(80) + chr(89) + chr(83) + chr(72) + chr(95))))) | wc -l > hy_env_count.txt",
+            "check": lambda tmp, sess: int((tmp / 'hy_env_count.txt').read_text().strip()) >= 1,
+        },
+        {
+            "name": "hybrid_python_filter_in_pipeline",
+            "py_vars": {"HY_NUM_LIST": "1\n2\n3\n"},
+            "command": "print(HY_NUM_LIST) | print(chr(10).join(line for line in SYS.stdin.read().splitlines() if line != str(2))) | grep 3 > hy_only_three.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_only_three.txt').read_text() == '3\n',
+        },
+        {
+            "name": "hybrid_python_json_grep",
+            "command": "print(JSON.dumps(dict(a=1, b=2))) | grep b > hy_json.txt",
+            "check": lambda tmp, sess: 'b' in (tmp / 'hy_json.txt').read_text(),
+        },
+        {
+            "name": "hybrid_tail_python_cut_chain",
+            "py_vars": {"HY_SPANISH": "uno\ndos\ntres"},
+            "command": "print(HY_SPANISH) | tail -n2 | print(chr(44).join(SYS.stdin.read().splitlines())) | cut -d',' -f2 > hy_final.txt",
+            "check": lambda tmp, sess: (tmp / 'hy_final.txt').read_text() == 'tres\n',
+        },
+        {
+            "name": "hybrid_shell_python_even_filter",
+            "prepare": lambda sess, tmp: (tmp / 'hy_nums2.txt').write_text('0\n1\n2\n3\n4\n'),
+            "command": "cat hy_nums2.txt | print(chr(10).join(line for line in SYS.stdin.read().splitlines() if int(line) % 2 == 0)) | wc -l > hy_even_count.txt",
+            "check": lambda tmp, sess: int((tmp / 'hy_even_count.txt').read_text().strip()) == 3,
+        },
+        {
+            "name": "hybrid_python_background_rejected",
+            "py_vars": {"HY_HI": "hi"},
+            "command": "print(HY_HI) | wc -c &",
+            "rc": (1,),
+            "stderr_contains": "python stages cannot run in background pipelines",
+            "check": lambda tmp, sess: not sess.background_jobs,
+        },
+    ]
+
+    tests = []
+
+    for spec in scenarios:
+        def make_test(spec: dict):
+            def _test(sess: ShellSession, tmp: Path, spec: dict = spec) -> None:
+                sentinel = object()
+                sess.py_vars.clear()
+                sess.background_jobs.clear()
+                sess.py_vars["SYS"] = __import__("sys")
+                sess.py_vars["JSON"] = __import__("json")
+                sess.py_vars.update(spec.get("py_vars", {}))
+                env_updates = spec.get("env", {})
+                previous_env = {key: sess.env.get(key, sentinel) for key in env_updates}
+                try:
+                    for key, value in env_updates.items():
+                        if value is None:
+                            sess.env.pop(key, None)
+                        else:
+                            sess.env[key] = value
+                    prepare = spec.get("prepare")
+                    if prepare:
+                        prepare(sess, tmp)
+                    for cmd in spec.get("setup", []):
+                        rc_pre = run_line(cmd, sess)
+                        assert rc_pre in spec.get("setup_rc", (0, 1))
+                    stderr_expected = spec.get("stderr_contains")
+                    if stderr_expected is not None:
+                        buf = io.StringIO()
+                        with redirect_stderr(buf):
+                            rc = run_line(spec["command"], sess)
+                        err_output = buf.getvalue()
+                        assert stderr_expected in err_output
+                    else:
+                        rc = run_line(spec["command"], sess)
+                    expected_rcs = spec.get("rc", (0,))
+                    assert rc in expected_rcs
+                    check = spec.get("check")
+                    if check:
+                        result = check(tmp, sess)
+                        if result is not None:
+                            assert result
+                finally:
+                    for key, old in previous_env.items():
+                        if old is sentinel:
+                            sess.env.pop(key, None)
+                        else:
+                            sess.env[key] = old
+                    sess.py_vars.clear()
+                    cleanup = spec.get("cleanup")
+                    if cleanup:
+                        cleanup(sess, tmp)
+
+            _test.__name__ = spec["name"]
+            return _test
+
+        tests.append(make_test(spec))
 
     return tests
 
@@ -1388,9 +1672,8 @@ def test_compare_pysh_vs_shell_phonebook(sess: ShellSession, tmp: Path):
     cmd2 = "sort -t '|' -k1,1 test.psv | nl -ba -w1 -s '|' > phonebook.psv"
     assert run_line(cmd2, sess_py) in (0, 1)
 
-    # Task3: lowercase names in place (left side of the first '|')
-    # GNU sed: \L to lower-case capture group
-    cmd3 = "sed -i -E 's/^([^|]+)/\\L\\1/' phonebook.psv"
+    # Task3: lowercase names in place (left side of the first '|') using awk
+    cmd3 = "awk -F'|' 'BEGIN{OFS=\"|\"} { $1=tolower($1); print }' phonebook.psv > phonebook.tmp && mv phonebook.tmp phonebook.psv"
     assert run_line(cmd3, sess_py) in (0, 1)
 
     # --- system shell path ---
@@ -1404,7 +1687,7 @@ def test_compare_pysh_vs_shell_phonebook(sess: ShellSession, tmp: Path):
 
     sh_run("cat test.psv > cat_out.txt")
     sh_run("sort -t '|' -k1,1 test.psv | nl -ba -w1 -s '|' > phonebook.psv")
-    sh_run("sed -i -E 's/^([^|]+)/\\L\\1/' phonebook.psv")
+    sh_run("awk -F'|' 'BEGIN{OFS=\"|\"} { $1=tolower($1); print }' phonebook.psv > phonebook.tmp && mv phonebook.tmp phonebook.psv")
 
     # --- Compare outputs exactly ---
     os.chdir(tmp)  # ensure no lingering cwd locks
@@ -1434,6 +1717,7 @@ def collect_tests(extend: bool):
     base_tests = [
         test_pwd_and_fs_ops,
         test_pipeline_grep,
+        test_python_pipeline_into_shell,
         test_redirection_and_dup,
         test_to_devnull,
         # Quote/operator edge cases
@@ -1465,6 +1749,7 @@ def collect_tests(extend: bool):
     ]
     # Append per-command comprehensive tests
     base_tests += build_guaranteed_command_tests()
+    base_tests += build_hybrid_command_tests()
     if not extend:
         return base_tests
     return base_tests + [

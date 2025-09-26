@@ -32,5 +32,12 @@ these commands are well tested and should work fine
 - grep would enable Perl mode (-P) by default, use -G to use BRE
 
 
-## Loop
+## Loop, functions and if-else
 - pysh loop uses python loop syntax, such as TODO
+- same for def and if/else
+
+
+## Hybrid commands
+- pysh supports combining mixing shell and python commands together.
+- Generally pysh would prioritize shell commands, but within functions, loops or if-else conditions, pysh will look for variables and functions first.
+- Notice that if link pipeline commands, '|' will only pass the output to stdout to next command, not the return value

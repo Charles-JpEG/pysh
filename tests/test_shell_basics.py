@@ -49,6 +49,15 @@ def test_pipeline_grep(session, tmp_path, content, pattern, expected):
         assert filtered == ""
 
 
+def test_python_pipeline_into_shell(session, tmp_path):
+    run_line("ENV = {'COLOR': 'blue', 'OTHER': 'green'}", session)
+    code = run_line("print(ENV) | grep COLOR > env_hit.txt", session)
+    assert code in (0, 1)
+    text = (tmp_path / "env_hit.txt").read_text()
+    assert "COLOR" in text
+    assert "blue" in text
+
+
 def test_redirection_and_dup(session, tmp_path):
     code = run_line("sh -c 'echo out; echo err 1>&2' >o.txt 2>&1", session)
     assert code == 0
