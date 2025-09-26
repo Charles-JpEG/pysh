@@ -97,10 +97,12 @@ class PyshTester:
 
     # ------------------------------------------------------------------
     def _match_prompt(self, buffer: str) -> Optional[str]:
-        if buffer.endswith(self.continuation_prompt):
-            return self.continuation_prompt
-        if buffer.endswith(self.prompt):
-            return self.prompt
+        last_newline = buffer.rfind("\n")
+        tail = buffer[last_newline + 1 :] if last_newline != -1 else buffer
+        if tail.startswith(self.continuation_prompt):
+            return tail
+        if tail.startswith(self.prompt):
+            return tail
         return None
 
     def _collect_until_prompt(self, timeout: float) -> tuple[str, str, str]:

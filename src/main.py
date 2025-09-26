@@ -8,6 +8,13 @@ import os
 import sys
 from typing import Optional
 
+try:
+    import readline  # type: ignore
+except Exception:  # pragma: no cover - fallback when readline unavailable
+    readline = None
+
+READLINE_ACTIVE = bool(readline)
+
 PROMPT = "pysh> "
 CONTINUATION_PROMPT = "... "
 
@@ -28,29 +35,54 @@ def get_default_shell() -> str:
 
 
 def setup_readline() -> None:
-    # Enable Ctrl-L to clear screen and basic line editing if readline is available
+    if not READLINE_ACTIVE:
+        return
     try:
-        import readline  # type: ignore
-
-        # Ensure emacs-style bindings and explicit clear-screen on Ctrl-L
         readline.parse_and_bind("set editing-mode emacs")
         readline.parse_and_bind("Control-l: clear-screen")
-        # Let Ctrl-D send EOF (default behavior); no binding needed
     except Exception:
-        # readline not available; Ctrl-L won't clear without pressing Enter
         pass
+
+
+def _set_indent_prefill(indent: str) -> None:
+    if not READLINE_ACTIVE or not sys.stdin.isatty():
+        return
+
+    def hook() -> None:
+        try:
+            readline.insert_text(indent)
+            readline.redisplay()
+        finally:
+            readline.set_pre_input_hook(None)
+
+    readline.set_pre_input_hook(hook)
 
 
 def repl() -> int:
     shell = get_default_shell()
     session = ShellSession(shell=shell, inherit_env=True)
 
-    # setup_readline()  # Disabled for testing
+    setup_readline()
+    readline_enabled = READLINE_ACTIVE and sys.stdin.isatty()
 
     last_runner: Optional[CommandRunner] = None
     while True:
         try:
-            prompt = CONTINUATION_PROMPT if session.in_multi_line else PROMPT
+            if session.in_multi_line:
+                indent_unit = session.get_indent_unit()
+                indent = indent_unit * max(session.current_indent_level, 0)
+                if readline_enabled:
+                    if indent:
+                        _set_indent_prefill(indent)
+                    else:
+                        readline.set_pre_input_hook(None)  # type: ignore[attr-defined]
+                    prompt = CONTINUATION_PROMPT
+                else:
+                    prompt = CONTINUATION_PROMPT + indent
+            else:
+                if readline_enabled:
+                    readline.set_pre_input_hook(None)  # type: ignore[attr-defined]
+                prompt = PROMPT
             # Preserve the line exactly as typed (no strip/rstrip)
             line = input(prompt)
         except EOFError:
