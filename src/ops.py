@@ -8,6 +8,19 @@ import shutil
 from typing import Optional, Dict, List, Tuple, Any
 
 
+# ---- Token model for parsing (word vs operator) ----
+class Token:
+    def __init__(self, kind: str, value: str, quoting: str = 'unquoted') -> None:
+        # kind in { 'WORD', 'OP' }
+        # quoting in { 'unquoted', 'single', 'double' }
+        self.kind = kind
+        self.value = value
+        self.quoting = quoting
+
+    def __repr__(self) -> str:
+        return f"Token({self.kind!r}, {self.value!r}, {self.quoting!r})"
+
+
 class ShellSession:
     """Holds session-wide shell context like environment variables.
 
@@ -59,7 +72,7 @@ GUARANTEED_COMMANDS: set[str] = {
 }
 
 
-def _expand_vars_in_line(line: str, session: ShellSession) -> str:
+def _expand_vars_in_line(line: str, session: ShellSession, *, force_double: bool = False) -> str:
     """Expand $var and ${var} using session vars/env.
 
     Rules (pysh simplified):
@@ -72,7 +85,7 @@ def _expand_vars_in_line(line: str, session: ShellSession) -> str:
     i = 0
     n = len(line)
     in_single = False
-    in_double = False
+    in_double = force_double
     while i < n:
         ch = line[i]
         if ch == "'":
@@ -86,9 +99,10 @@ def _expand_vars_in_line(line: str, session: ShellSession) -> str:
             i += 1
             continue
         if ch == '\\' and not in_single:
-            # Escape next character (if any)
-            if i + 1 < n:
-                out.append(line[i + 1])
+            # For expansion, only consume backslash when escaping a dollar sign.
+            # Otherwise, preserve the backslash for the tokenizer to handle.
+            if i + 1 < n and line[i + 1] == '$':
+                out.append('$')
                 i += 2
                 continue
             else:
@@ -137,6 +151,24 @@ def _expand_vars_in_line(line: str, session: ShellSession) -> str:
         out.append(ch)
         i += 1
     return ''.join(out)
+
+
+def _expand_word(word: str, quoting: str, session: ShellSession) -> str:
+    # Handle sentinel markers injected during tokenization
+    if word.startswith("\x00S"):
+        # Single-quoted: return literally, no expansion
+        return word[2:]
+    force_double = False
+    if word.startswith("\x00D"):
+        force_double = True
+        word = word[2:]
+    # Expand command substitutions first, then variables
+    s = _expand_command_substitutions(word, session, for_python=False)
+    s = _expand_vars_in_line(s, session, force_double=force_double)
+    # Expand ~ at start of unquoted words
+    if quoting == 'unquoted' and s.startswith('~'):
+        s = os.path.expanduser(s)
+    return s
 
 
 def _try_python_assignment(line: str, session: ShellSession) -> Optional[int]:
@@ -234,6 +266,26 @@ def try_python(line: str, session: ShellSession) -> Optional[int]:
                     sys.stderr.flush()
                     return 1
 
+    # Handle expression statements (like bare variable names) by evaluating and printing
+    if len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
+        expr = tree.body[0].value
+        eval_locals: Dict[str, Any] = dict(session.env)
+        eval_locals.update(session.py_vars)
+        try:
+            val = eval(compile(ast.Expression(body=expr), '<pysh>', 'eval'), {"__builtins__": __builtins__}, eval_locals)
+            # Print the value like REPL; update last value to underscore variable _
+            try:
+                session.py_vars['_'] = val
+            except Exception:
+                pass
+            sys.stdout.write(str(val) + "\n")
+            sys.stdout.flush()
+            return 0
+        except Exception as e:
+            sys.stderr.write(f"pysh(py-eval): {e}\n")
+            sys.stderr.flush()
+            return 1
+
     exec_locals: Dict[str, Any] = dict(session.env)
     exec_locals.update(session.py_vars)
     try:
@@ -329,8 +381,8 @@ class Redirection:
 
 
 class SimpleCommand:
-    def __init__(self, argv: List[str]) -> None:
-        self.argv = argv
+    def __init__(self, argv: List[Tuple[str, str]]) -> None:
+        self.argv = argv  # list of (value, quoting)
         self.redirs: List[Redirection] = []
 
 
@@ -347,96 +399,252 @@ class SequenceUnit:
         self.next_op = next_op
 
 
-def _tokenize(line: str) -> List[str]:
-    import shlex as _shlex
-
-    # Split punctuation so operators are separate tokens
-    lex = _shlex.shlex(line, posix=True, punctuation_chars='|&;<>')
-    lex.whitespace_split = True
-    tokens = list(lex)
-
-    # Combine multi-char operators: &&, ||, >>, <<, 2>&1 patterns will be handled in parser
-    combined: List[str] = []
+def _tokenize(line: str) -> List[Token]:
+    tokens: List[Token] = []
+    buf: List[str] = []
     i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if i + 1 < len(tokens):
-            t2 = tokens[i + 1]
-            if t == '&' and t2 == '&':
-                combined.append('&&'); i += 2; continue
-            if t == '|' and t2 == '|':
-                combined.append('||'); i += 2; continue
-            if t == '>' and t2 == '>':
-                combined.append('>>'); i += 2; continue
-            if t == '<' and t2 == '<':
-                combined.append('<<'); i += 2; continue
-            if t == '>' and t2 == '&':
-                combined.append('>&'); i += 2; continue
-        combined.append(t)
+    n = len(line)
+    in_single = False
+    in_double = False
+    # Track context for current buffer to mark fully quoted tokens
+    buf_seen_single = False
+    buf_seen_double = False
+    buf_seen_unquoted = False
+
+    def flush_buf() -> None:
+        nonlocal buf_seen_single, buf_seen_double, buf_seen_unquoted
+        if buf:
+            val = ''.join(buf)
+            # Determine quoting
+            quoting = 'unquoted'
+            if buf_seen_single and not buf_seen_double and not buf_seen_unquoted:
+                quoting = 'single'
+                val = '\x00S' + val
+            elif buf_seen_double and not buf_seen_single and not buf_seen_unquoted:
+                quoting = 'double'
+                val = '\x00D' + val
+            tokens.append(Token('WORD', val, quoting))
+            buf.clear()
+            buf_seen_single = buf_seen_double = buf_seen_unquoted = False
+
+    while i < n:
+        ch = line[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if ch == '\\' and not in_single:
+            # Escape next character
+            if i + 1 < n:
+                nxt = line[i + 1]
+                # Preserve escape before '$' so expansion can detect it
+                if nxt == '$':
+                    buf.append('\\')
+                    buf.append('$')
+                else:
+                    buf.append(nxt)
+                if in_single:
+                    buf_seen_single = True
+                elif in_double:
+                    buf_seen_double = True
+                else:
+                    buf_seen_unquoted = True
+                i += 2
+                continue
+            else:
+                buf.append('\\')
+                if in_single:
+                    buf_seen_single = True
+                elif in_double:
+                    buf_seen_double = True
+                else:
+                    buf_seen_unquoted = True
+                i += 1
+                continue
+        if not in_single and not in_double:
+            # Whitespace separates arguments
+            if ch.isspace():
+                flush_buf()
+                i += 1
+                continue
+            # Operators
+            if ch in ('|', '&', ';', '<', '>'):
+                flush_buf()
+                # Lookahead for two-char operators
+                if i + 1 < n:
+                    nxt = line[i + 1]
+                    if ch == '&' and nxt == '&':
+                        tokens.append(Token('OP', '&&')); i += 2; continue
+                    if ch == '|' and nxt == '|':
+                        tokens.append(Token('OP', '||')); i += 2; continue
+                    if ch == '>' and nxt == '>':
+                        tokens.append(Token('OP', '>>')); i += 2; continue
+                    if ch == '<' and nxt == '<':
+                        tokens.append(Token('OP', '<<')); i += 2; continue
+                    if ch == '>' and nxt == '&':
+                        tokens.append(Token('OP', '>&')); i += 2; continue
+                tokens.append(Token('OP', ch))
+                i += 1
+                continue
+        # Default: accumulate character
+        buf.append(ch)
+        if in_single:
+            buf_seen_single = True
+        elif in_double:
+            buf_seen_double = True
+        else:
+            buf_seen_unquoted = True
         i += 1
-    return combined
+
+    flush_buf()
+    return tokens
+
+
+def _expand_command_substitutions(line: str, session: ShellSession, *, for_python: bool) -> str:
+    """Expand $(...) by executing the inner text via the system shell.
+
+    - Respects quoting: disabled in single quotes; allowed in double quotes and unquoted.
+    - Supports nested parentheses within $(...).
+    - Trims trailing newlines from the command output (shell-like behavior).
+    - When for_python=True, inserts a Python string literal representing the output.
+      When for_python=False, inserts the raw text (no further quoting is added).
+    """
+    out: List[str] = []
+    i = 0
+    n = len(line)
+    in_single = False
+    in_double = False
+
+    while i < n:
+        ch = line[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '$' and i + 1 < n and line[i + 1] == '(' and not in_single:
+            # find matching closing ')', handle nesting and escapes
+            j = i + 2
+            depth = 1
+            while j < n:
+                c = line[j]
+                if c == '\\' and j + 1 < n:
+                    j += 2
+                    continue
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if j >= n or depth != 0:
+                # Unmatched, treat '$' literally
+                out.append('$')
+                i += 1
+                continue
+            inner = line[i + 2:j]
+            try:
+                completed = subprocess.run(
+                    [session.shell, '-c', inner],
+                    capture_output=True,
+                    text=True,
+                    env=session.get_env(),
+                )
+                subst = completed.stdout.rstrip('\n')
+            except Exception as e:
+                subst = f"<pysh-error:{e}>"
+
+            if for_python:
+                # Insert as Python string literal
+                out.append(repr(subst))
+            else:
+                out.append(subst)
+            i = j + 1
+            continue
+        # default
+        out.append(ch)
+        i += 1
+    return ''.join(out)
 
 
 def has_operators(line: str) -> bool:
-    # Determine if line contains shell operators that we handle
-    ops = {'|', '&&', '||', ';', '&', '>', '>>', '<'}
-    toks = _tokenize(line)
-    return any(t in ops or (t.isdigit() and i + 1 < len(toks) and toks[i + 1] in ('>&',)) for i, t in enumerate(toks))
+    # Quote-aware scan for pipe/and/or/sequence/redirection via typed tokens
+    tokens = _tokenize(line)
+    for t in tokens:
+        if t.kind == 'OP':
+            if t.value in {'|', '&&', '||', ';', '&', '>', '>>', '<', '>&'}:
+                return True
+    return False
 
 
-def _parse_redirection(tokens: List[str], i: int, cmd: SimpleCommand) -> int:
+def _parse_redirection(tokens: List[Token], i: int, cmd: SimpleCommand) -> int:
     # Supports: > file, >> file, < file, [n]> file, [n]>> file, 2>&1
     # tokens[i] is either '>', '>>', '<' or an int fd followed by those
-    def is_int(s: str) -> bool:
-        return s.isdigit()
+    def is_int_tok(tok: Token) -> bool:
+        return tok.kind == 'WORD' and tok.value.isdigit()
 
     fd: int = 1
-    op = tokens[i]
+    op_tok = tokens[i]
     j = i + 1
-    if is_int(op):
+    if is_int_tok(op_tok):
         # numeric fd specified
         if j >= len(tokens):
             raise ValueError("redirection missing operator after fd")
-        fd = int(op)
-        op = tokens[j]
+        fd = int(op_tok.value)
+        op_tok = tokens[j]
         j += 1
 
     # Dup redirection: n>&m must be checked before normal file redirection
-    if op == '>&':
-        if j >= len(tokens) or not is_int(tokens[j]):
+    if op_tok.kind == 'OP' and op_tok.value == '>&':
+        if j >= len(tokens) or not is_int_tok(tokens[j]):
             raise ValueError("dup redirection requires numeric fd target, e.g., 2>&1")
-        to_fd = int(tokens[j])
+        to_fd = int(tokens[j].value)
         cmd.redirs.append(Redirection(fd, 'dup', to_fd))
         return j + 1
-    if op == '>' and j < len(tokens) and tokens[j] == '&':
-        if j + 1 >= len(tokens) or not is_int(tokens[j + 1]):
+    if op_tok.kind == 'OP' and op_tok.value == '>' and j < len(tokens) and tokens[j].kind == 'OP' and tokens[j].value == '&':
+        if j + 1 >= len(tokens) or not is_int_tok(tokens[j + 1]):
             raise ValueError("dup redirection requires numeric fd target, e.g., 2>&1")
-        to_fd = int(tokens[j + 1])
+        to_fd = int(tokens[j + 1].value)
+        cmd.redirs.append(Redirection(fd, 'dup', to_fd))
+        return j + 2
+    # Allow spaced form: n > & m
+    if op_tok.kind == 'OP' and op_tok.value == '>' and j + 1 < len(tokens) and tokens[j].kind == 'OP' and tokens[j].value == '&' and is_int_tok(tokens[j + 1]):
+        to_fd = int(tokens[j + 1].value)
         cmd.redirs.append(Redirection(fd, 'dup', to_fd))
         return j + 2
 
-    if op in ('>', '>>', '<'):
+    if op_tok.kind == 'OP' and op_tok.value in ('>', '>>', '<'):
         if j >= len(tokens):
             raise ValueError("redirection missing target")
-        target = tokens[j]
-        cmd.redirs.append(Redirection(fd, op, target))
+        target_tok = tokens[j]
+        cmd.redirs.append(Redirection(fd, op_tok.value, target_tok.value))
         return j + 1
 
-    raise ValueError(f"unsupported redirection near: {' '.join(tokens[i:j+1])}")
+    raise ValueError(f"unsupported redirection near: {' '.join(t.value for t in tokens[i:j+1])}")
 
 
-def _parse_simple(tokens: List[str], i: int) -> Tuple[SimpleCommand, int]:
+def _parse_simple(tokens: List[Token], i: int) -> Tuple[SimpleCommand, int]:
     argv: List[str] = []
     while i < len(tokens):
         t = tokens[i]
-        if t in ('|', '&&', '||', ';', '&'):
+        if t.kind == 'OP' and t.value in ('|', '&&', '||', ';', '&'):
             break
         # redirection starts: either operator or leading numeric fd
-        if t in ('>', '>>', '<') or t.isdigit():
+        if (t.kind == 'OP' and t.value in ('>', '>>', '<')) or (t.kind == 'WORD' and t.value.isdigit()):
             i = _parse_redirection(tokens, i, SimpleCommand(argv) if False else None)  # type: ignore
             # The above line is placeholder to satisfy typing in mypy-like tools; will be replaced below
         else:
-            argv.append(t)
+            argv.append(t.value)
             i += 1
         # To actually record redirs on the current command, we need the command object.
     # Now reconstruct by walking again to attach redirs; simpler: parse in one pass with a command object.
@@ -448,35 +656,38 @@ def _parse_simple(tokens: List[str], i: int) -> Tuple[SimpleCommand, int]:
     # Let's implement properly in a single pass instead of above.
 
 
-def _parse_simple_proper(tokens: List[str], i: int) -> Tuple[SimpleCommand, int]:
+def _parse_simple_proper(tokens: List[Token], i: int) -> Tuple[SimpleCommand, int]:
     cmd = SimpleCommand(argv=[])
     while i < len(tokens):
         t = tokens[i]
-        if t in ('|', '&&', '||', ';', '&'):
+        if t.kind == 'OP' and t.value in ('|', '&&', '||', ';', '&'):
             break
-        if t in ('>', '>>', '<', '>&'):
+        if t.kind == 'OP' and t.value in ('>', '>>', '<', '>&'):
             i = _parse_redirection(tokens, i, cmd)
-        elif t.isdigit():
+        elif t.kind == 'WORD' and t.value.isdigit():
             # Interpret as fd redirection only for dup syntax (n>&m).
             # Do NOT treat a bare number before '>' as fd (e.g., 'echo 10 > f')
-            if i + 1 < len(tokens) and tokens[i + 1] in ('>&',):
+            if i + 1 < len(tokens) and (
+                (tokens[i + 1].kind == 'OP' and tokens[i + 1].value in ('>&',)) or
+                (tokens[i + 1].kind == 'OP' and tokens[i + 1].value == '>' and i + 2 < len(tokens) and tokens[i + 2].kind == 'OP' and tokens[i + 2].value == '&')
+            ):
                 i = _parse_redirection(tokens, i, cmd)
             else:
-                cmd.argv.append(t)
+                cmd.argv.append((t.value, t.quoting))
                 i += 1
         else:
-            cmd.argv.append(t)
+            cmd.argv.append((t.value, t.quoting))
             i += 1
     return cmd, i
 
 
-def _parse_pipeline(tokens: List[str], i: int) -> Tuple[Pipeline, int]:
+def _parse_pipeline(tokens: List[Token], i: int) -> Tuple[Pipeline, int]:
     commands: List[SimpleCommand] = []
     cmd, i = _parse_simple_proper(tokens, i)
     if not cmd.argv and not cmd.redirs:
         raise ValueError("empty command")
     commands.append(cmd)
-    while i < len(tokens) and tokens[i] == '|':
+    while i < len(tokens) and tokens[i].kind == 'OP' and tokens[i].value == '|':
         i += 1
         cmd, i = _parse_simple_proper(tokens, i)
         if not cmd.argv:
@@ -484,21 +695,21 @@ def _parse_pipeline(tokens: List[str], i: int) -> Tuple[Pipeline, int]:
         commands.append(cmd)
 
     background = False
-    if i < len(tokens) and tokens[i] == '&':
+    if i < len(tokens) and tokens[i].kind == 'OP' and tokens[i].value == '&':
         background = True
         i += 1
 
     return Pipeline(commands, background), i
 
 
-def _parse_sequence(tokens: List[str]) -> List[SequenceUnit]:
+def _parse_sequence(tokens: List[Token]) -> List[SequenceUnit]:
     i = 0
     units: List[SequenceUnit] = []
     while i < len(tokens):
         pipeline, i = _parse_pipeline(tokens, i)
         next_op: Optional[str] = None
-        if i < len(tokens) and tokens[i] in (';', '&&', '||'):
-            next_op = tokens[i]
+        if i < len(tokens) and tokens[i].kind == 'OP' and tokens[i].value in (';', '&&', '||'):
+            next_op = tokens[i].value
             i += 1
         units.append(SequenceUnit(pipeline, next_op))
     return units
@@ -511,8 +722,6 @@ def _apply_redirections(cmd: SimpleCommand) -> Tuple[Optional[int], Optional[int
     stderr_fd = None
     closers: List = []
 
-    # Track dup stderr to stdout
-    dup_stderr_to_stdout = False
     for r in cmd.redirs:
         if r.op == '<':
             f = open(r.target, 'rb')
@@ -534,27 +743,27 @@ def _apply_redirections(cmd: SimpleCommand) -> Tuple[Optional[int], Optional[int
                 stderr_fd = f.fileno()
         elif r.op == 'dup':
             if r.fd == 2 and isinstance(r.target, int) and r.target == 1:
-                dup_stderr_to_stdout = True
+                stderr_fd = stdout_fd
             else:
                 # Minimal support: only 2>&1
                 raise ValueError("only 2>&1 is supported for dup redirection right now")
         else:
             raise ValueError(f"unsupported redirection: {r.op}")
 
-    return stdin_fd, stdout_fd, (subprocess.STDOUT if dup_stderr_to_stdout else stderr_fd), closers
+    return stdin_fd, stdout_fd, stderr_fd, closers
 
 
 def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:
     # Handle built-in 'cd' when it's not part of a pipeline and without redirections
     if len(p.commands) == 1:
         cmd0 = p.commands[0]
-        if cmd0.argv and cmd0.argv[0] == 'cd' and not cmd0.redirs:
+        if cmd0.argv and cmd0.argv[0][0] == 'cd' and not cmd0.redirs:
             # cd [dir]
             target = None
             if len(cmd0.argv) == 1:
                 target = session.get_env().get('HOME') or os.path.expanduser('~')
             else:
-                target = cmd0.argv[1]
+                target = _expand_word(cmd0.argv[1][0], cmd0.argv[1][1], session)
             try:
                 os.chdir(target)
                 # Update PWD in both environment and python vars to keep them in sync
@@ -572,7 +781,21 @@ def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:
     open_handles: List = []
     try:
         for idx, cmd in enumerate(p.commands):
+            # Expand argv and redirection targets per word
+            local_argv = [_expand_word(value, quoting, session) for value, quoting in cmd.argv]
+            # Apply default grep engine tweak on expanded argv
+            if local_argv:
+                prog_name = os.path.basename(local_argv[0])
+            else:
+                prog_name = ''
+
+            # Expand redirection targets
+            for r in cmd.redirs:
+                if r.op in ('>', '>>', '<') and isinstance(r.target, str):
+                    r.target = _expand_word(r.target, 'unquoted', session)
+
             stdin_fd, stdout_fd, stderr_fd, closers = _apply_redirections(cmd)
+            open_handles.extend(closers)
             open_handles.extend(closers)
 
             stdin = prev_stdout if prev_stdout is not None else (stdin_fd if stdin_fd is not None else None)
@@ -585,15 +808,13 @@ def _exec_pipeline(p: Pipeline, session: ShellSession) -> int:
             stderr = stderr_fd if stderr_fd is not None else None
 
             # Spec tweak: default grep engine is PCRE (-P) unless an engine flag is provided
-            if cmd.argv:
-                prog = os.path.basename(cmd.argv[0])
-                if prog == 'grep':
-                    engine_flags = {'-E', '--extended-regexp', '-F', '--fixed-strings', '-G', '--basic-regexp', '-P', '--perl-regexp'}
-                    if not any(a in engine_flags for a in cmd.argv[1:]):
-                        cmd.argv.insert(1, '-P')
+            if prog_name == 'grep':
+                engine_flags = {'-E', '--extended-regexp', '-F', '--fixed-strings', '-G', '--basic-regexp', '-P', '--perl-regexp'}
+                if not any(a in engine_flags for a in local_argv[1:]):
+                    local_argv.insert(1, '-P')
 
             proc = subprocess.Popen(
-                cmd.argv,
+                local_argv,
                 stdin=stdin,
                 stdout=stdout,
                 stderr=stderr,
@@ -655,10 +876,18 @@ def _exec_sequence(units: List[SequenceUnit], session: ShellSession) -> int:
 
 
 def execute_line(line: str, session: ShellSession) -> int:
-    # Route selection per spec: prefer shell operators and commands first.
-    if has_operators(line):
-        expanded = _expand_vars_in_line(line, session)
-        tokens = _tokenize(expanded)
+    # Prepare both Python and shell views of the line
+    line_py = _expand_command_substitutions(line, session, for_python=True)
+    # Fast path: if this is a Python assignment, handle it first regardless of operators in substituted text
+    handled = _try_python_assignment(line_py, session)
+    if handled is not None:
+        return handled
+
+    line_shell = _expand_command_substitutions(line, session, for_python=False)
+    # Route selection per spec: prefer shell operators and commands next.
+    if has_operators(line_shell):
+        # Tokenize without pre-expanding variables to preserve escapes and quoting
+        tokens = _tokenize(line_shell)
         if not tokens:
             return 0
         units = _parse_sequence(tokens)
@@ -666,25 +895,22 @@ def execute_line(line: str, session: ShellSession) -> int:
 
     # No operators: check command presence first
     import shlex as _shlex
-    lex = _shlex.shlex(line, posix=True)
+    lex = _shlex.shlex(line_shell, posix=True)
     lex.whitespace_split = True
     simple_tokens = list(lex)
     if simple_tokens:
         cmd = simple_tokens[0]
         if cmd == 'cd' or shutil.which(cmd, mode=os.F_OK | os.X_OK, path=session.get_env().get('PATH', os.defpath)):
-            expanded = _expand_vars_in_line(line, session)
-            tokens = _tokenize(expanded)
+            tokens = _tokenize(line_shell)
             if not tokens:
                 return 0
             units = _parse_sequence(tokens)
             return _exec_sequence(units, session)
 
     # Not a shell command: attempt Python (assignment fast-path first to set vars quietly)
-    handled = _try_python_assignment(line, session)
-    if handled is not None:
-        return handled
-
-    rc = try_python(line, session)
+    # Expand command substitutions for Python context (as string literals)
+    line_py = _expand_command_substitutions(line, session, for_python=True)
+    rc = try_python(line_py, session)
     if rc is None:
         sys.stderr.write(f"pysh: command or python code not found: {line}\n")
         sys.stderr.flush()

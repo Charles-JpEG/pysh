@@ -15,6 +15,8 @@ import os
 import shutil
 import sys
 import tempfile
+import subprocess
+import random
 from pathlib import Path
 
 # Allow importing from src/
@@ -124,6 +126,60 @@ def test_simple_command_runner_capture(sess: ShellSession, tmp: Path):
 def test_env_contains_sanitized_vars(sess: ShellSession, tmp: Path):
     # We won't parse output here; just ensure the command runs
     assert run_line("env", sess) in (0, 1)
+
+
+def test_tilde_expansion(sess: ShellSession, tmp: Path):
+    # ~ should expand to home directory when used at start of unquoted path
+    out = _run_and_read("echo ~", tmp / 'o.txt', sess).strip()
+    assert out == str(Path.home())
+
+
+def test_ls_tilde(sess: ShellSession, tmp: Path):
+    # ls ~ should expand ~ and list home directory
+    rc = run_line("ls ~", sess)
+    assert rc == 0
+
+
+# ---- Quote/operator edge cases ----
+
+def test_quoted_pipe_literal(sess: ShellSession, tmp: Path):
+    # '|' inside quotes must not be treated as a pipe operator
+    assert run_line("echo 'a|b' > qp.txt", sess) in (0, 1)
+    out = (tmp / 'qp.txt').read_text().strip()
+    assert out == 'a|b'
+
+
+def test_escaped_pipe_literal(sess: ShellSession, tmp: Path):
+    # Escaped pipe in unquoted context should be literal
+    assert run_line("echo a\|b > ep.txt", sess) in (0, 1)
+    out = (tmp / 'ep.txt').read_text().strip()
+    assert out == 'a|b'
+
+
+def test_operators_inside_quotes(sess: ShellSession, tmp: Path):
+    # Ensure logical OR '||' inside quotes is not parsed as operator
+    assert run_line("echo 'x||y' > qo.txt", sess) in (0, 1)
+    out = (tmp / 'qo.txt').read_text().strip()
+    assert out == 'x||y'
+
+
+def test_quoted_pipe_with_pipeline(sess: ShellSession, tmp: Path):
+    # Mix a real pipeline with a quoted pipe character in argument
+    assert run_line("printf 'a|b\n' | grep -F 'a|b' > mix.txt", sess) in (0, 1)
+    out = (tmp / 'mix.txt').read_text()
+    assert out == 'a|b\n'
+
+
+def test_dup_redirection_spaced_forms(sess: ShellSession, tmp: Path):
+    # Both compact and spaced dup forms should work: 2>&1 and 2 >& 1 / 2 > & 1
+    # 1) Compact form already covered elsewhere; test spaced variants here
+    assert run_line("sh -c 'echo out; echo err 1>&2' >o2.txt 2 >& 1", sess) in (0, 1)
+    text = (tmp / 'o2.txt').read_text()
+    assert 'out\n' in text and 'err\n' in text
+    # 2) With explicit separation between '>' and '&'
+    assert run_line("sh -c 'echo out; echo err 1>&2' >o3.txt 2 > & 1", sess) in (0, 1)
+    text2 = (tmp / 'o3.txt').read_text()
+    assert 'out\n' in text2 and 'err\n' in text2
 
 
 def test_find_txt_files(sess: ShellSession, tmp: Path):
@@ -355,7 +411,7 @@ def build_guaranteed_command_tests():
     def pwd_4(sess: ShellSession, tmp: Path):
         # PWD env should track real pwd
         out = _run_and_read("echo $PWD", tmp / 'o.txt', sess).strip()
-        assert out == str(tmp)
+        assert out == os.getcwd()
 
     def pwd_5(sess: ShellSession, tmp: Path):
         # After cd, PWD updates
@@ -976,16 +1032,95 @@ def test_rg_count(sess: ShellSession, tmp: Path):
     assert n == 2
 
 
+# ---- Extended comparison test: pysh vs system shell on a multi-step pipeline ----
+def test_compare_pysh_vs_shell_phonebook(sess: ShellSession, tmp: Path):
+    # Requires standard tools
+    if not has_cmd("sed"):
+        raise SkipTest("sed not installed")
+    if not has_cmd("nl"):
+        raise SkipTest("nl not installed")
+
+    rng = random.Random(42)
+    names = [
+        "Harry Potter", "Hermione Granger", "Ron Weasley", "Albus Dumbledore",
+        "Severus Snape", "Rubeus Hagrid", "Minerva McGonagall", "Sirius Black",
+        "Remus Lupin", "Draco Malfoy"
+    ]
+    rng.shuffle(names)
+    def phone() -> str:
+        return ''.join(rng.choice('0123456789') for _ in range(9))
+
+    # Create two separate sandboxes: one for pysh, one for system shell
+    py_dir = tmp / 'pb_pysh'
+    sh_dir = tmp / 'pb_shell'
+    py_dir.mkdir(exist_ok=True)
+    sh_dir.mkdir(exist_ok=True)
+
+    py_file = py_dir / 'test.psv'
+    sh_file = sh_dir / 'test.psv'
+    content_lines = [f"{n}|{phone()}" for n in names]
+    py_file.write_text('\n'.join(content_lines) + '\n')
+    sh_file.write_text('\n'.join(content_lines) + '\n')
+
+    # Environment for both
+    env = sandbox_env(tmp)
+
+    # --- pysh path (interactive via same session) ---
+    shell = os.environ.get("SHELL", "/bin/sh")
+    sess_py = ShellSession(shell=shell, inherit_env=False)
+    sess_py.env.update(env)
+
+    # Task1: cat phonebook
+    os.chdir(py_dir)
+    assert run_line("cat test.psv > cat_out.txt", sess_py) in (0, 1)
+
+    # Task2: sort by name (field 1), then generate line numbers as id, write to phonebook.psv
+    # Using 'nl' for stable numbering with a '|' separator
+    cmd2 = "sort -t '|' -k1,1 test.psv | nl -ba -w1 -s '|' > phonebook.psv"
+    assert run_line(cmd2, sess_py) in (0, 1)
+
+    # Task3: lowercase names in place (left side of the first '|')
+    # GNU sed: \L to lower-case capture group
+    cmd3 = "sed -i -E 's/^([^|]+)/\\L\\1/' phonebook.psv"
+    assert run_line(cmd3, sess_py) in (0, 1)
+
+    # --- system shell path ---
+    os.chdir(sh_dir)
+    sh = os.environ.get("SHELL", "/bin/sh")
+
+    def sh_run(cmd: str) -> None:
+        r = subprocess.run([sh, "-c", cmd], cwd=sh_dir, env=env, capture_output=True, text=True)
+        if r.returncode not in (0, 1):
+            raise AssertionError(f"shell cmd failed: {cmd}\nstdout: {r.stdout}\nstderr: {r.stderr}")
+
+    sh_run("cat test.psv > cat_out.txt")
+    sh_run("sort -t '|' -k1,1 test.psv | nl -ba -w1 -s '|' > phonebook.psv")
+    sh_run("sed -i -E 's/^([^|]+)/\\L\\1/' phonebook.psv")
+
+    # --- Compare outputs exactly ---
+    os.chdir(tmp)  # ensure no lingering cwd locks
+    assert (py_dir / 'cat_out.txt').read_text() == (sh_dir / 'cat_out.txt').read_text()
+    assert (py_dir / 'phonebook.psv').read_text() == (sh_dir / 'phonebook.psv').read_text()
+
+
 def collect_tests(extend: bool):
     base_tests = [
         test_pwd_and_fs_ops,
         test_pipeline_grep,
         test_redirection_and_dup,
         test_to_devnull,
+        # Quote/operator edge cases
+        test_quoted_pipe_literal,
+        test_escaped_pipe_literal,
+        test_operators_inside_quotes,
+        test_quoted_pipe_with_pipeline,
+        test_dup_redirection_spaced_forms,
         test_conditionals,
         test_background,
         test_simple_command_runner_capture,
         test_env_contains_sanitized_vars,
+        test_tilde_expansion,
+        test_ls_tilde,
         test_find_txt_files,
         test_find_and_wc_count,
         test_sort_basic,
@@ -1009,6 +1144,7 @@ def collect_tests(extend: bool):
         test_fd_find_txt_files,
         test_rg_search,
         test_rg_count,
+        test_compare_pysh_vs_shell_phonebook,
     ]
 
 
