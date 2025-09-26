@@ -99,6 +99,14 @@ def test_pipeline_grep(sess: ShellSession, tmp: Path):
     assert code in (0, 1)
 
 
+def test_python_pipeline_into_shell(sess: ShellSession, tmp: Path):
+    assert run_line("ENV = {'COLOR': 'blue', 'OTHER': 'green'}", sess) == 0
+    rc = run_line("print(ENV) | grep COLOR > env_hit.txt", sess)
+    assert rc in (0, 1)
+    text = (tmp / "env_hit.txt").read_text()
+    assert "COLOR" in text and "blue" in text
+
+
 def test_redirection_and_dup(sess: ShellSession, tmp: Path):
     code = run_line("sh -c 'echo out; echo err 1>&2' >o.txt 2>&1", sess)
     assert code == 0
@@ -1434,6 +1442,7 @@ def collect_tests(extend: bool):
     base_tests = [
         test_pwd_and_fs_ops,
         test_pipeline_grep,
+        test_python_pipeline_into_shell,
         test_redirection_and_dup,
         test_to_devnull,
         # Quote/operator edge cases
