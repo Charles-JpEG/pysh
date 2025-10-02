@@ -302,6 +302,25 @@ def _try_python_assignment(line: str, session: ShellSession) -> Optional[int]:
         return 1
 
 
+def _pysh_exec_shell_helper(command: str, session: ShellSession) -> int:
+    """Helper function available in Python execution context to run shell commands."""
+    try:
+        # Expand variables and command substitutions for shell context
+        expanded_command = _expand_command_substitutions(command, session, for_python=False)
+        
+        # Parse and execute as shell command
+        tokens = _tokenize(expanded_command)
+        if not tokens:
+            return 0
+        
+        units = _parse_sequence(tokens)
+        return _exec_sequence(units, session)
+    except Exception as e:
+        sys.stderr.write(f"pysh: error executing shell command '{command}': {e}\n")
+        sys.stderr.flush()
+        return 1
+
+
 def try_python(line: str, session: ShellSession) -> Optional[int]:
     """Public API: Execute arbitrary Python code, updating session.py_vars.
 
@@ -361,12 +380,29 @@ def try_python(line: str, session: ShellSession) -> Optional[int]:
 
     exec_locals: Dict[str, Any] = dict(session.env)
     exec_locals.update(session.py_vars)
+    
+    # Add pysh helper functions to the execution context
+    def pysh_exec_shell_with_locals(cmd, local_vars):
+        # Temporarily update session.py_vars with current locals
+        original_vars = dict(session.py_vars)
+        session.py_vars.update(local_vars)
+        try:
+            return _pysh_exec_shell_helper(cmd, session)
+        finally:
+            # Restore original py_vars, but keep any new assignments
+            for k, v in session.py_vars.items():
+                if k not in original_vars or original_vars[k] != v:
+                    original_vars[k] = v
+            session.py_vars = original_vars
+    
+    exec_locals['__pysh_exec_shell'] = lambda cmd: pysh_exec_shell_with_locals(cmd, exec_locals)
+    
     try:
         code = compile(tree, '<pysh>', 'exec')
         exec(code, {"__builtins__": __builtins__}, exec_locals)
         # Sync back names (including imports)
         for k, v in exec_locals.items():
-            if k in ("__builtins__",):
+            if k in ("__builtins__", "__pysh_exec_shell"):
                 continue
             if not k or not (k[0].isalpha() or k[0] == '_'):
                 continue
@@ -1188,6 +1224,108 @@ def _exec_sequence(units: List[SequenceUnit], session: ShellSession) -> int:
     return last
 
 
+def _execute_hybrid_multiline_buffer(session: ShellSession) -> int:
+    """Execute a multi-line buffer with hybrid Python/shell line-by-line processing.
+    
+    This function processes each line in the multi-line buffer to determine if it should
+    be executed as Python or shell, even within Python control structures.
+    """
+    if not session.multi_line_buffer:
+        return 0
+    
+    # Convert the buffer into executable Python code where shell commands
+    # are wrapped in subprocess calls
+    converted_lines = []
+    
+    for line in session.multi_line_buffer:
+        converted_line = _convert_line_for_hybrid_execution(line, session)
+        converted_lines.append(converted_line)
+    
+    # Join and execute as Python
+    source = '\n'.join(converted_lines)
+    
+    try:
+        result = try_python(source, session)
+        return result if result is not None else 0
+    except Exception as e:
+        sys.stderr.write(f"pysh: error in hybrid multi-line execution: {e}\n")
+        sys.stderr.flush()
+        return 1
+
+
+def _convert_line_for_hybrid_execution(line: str, session: ShellSession) -> str:
+    """Convert a line for hybrid execution, wrapping shell commands in Python calls."""
+    
+    stripped = line.strip()
+    if not stripped or stripped.startswith('#'):
+        return line
+    
+    # Get the indentation
+    indent = line[:len(line) - len(line.lstrip())]
+    
+    # Check if this is a Python control structure line
+    if any(stripped.startswith(keyword + ' ') or stripped.startswith(keyword + ':') or stripped == keyword + ':'
+           for keyword in ['for', 'while', 'if', 'elif', 'else', 'def', 'class', 'with', 'try', 'except', 'finally']):
+        return line
+    
+    # Check if this line should be executed as shell
+    if _should_execute_as_shell(stripped, session):
+        # Instead of subprocess, use a simpler approach that calls the existing execute_line function
+        shell_code = f"__pysh_exec_shell({repr(stripped)})"
+        return indent + shell_code
+    
+    # Regular Python line
+    return line
+
+
+def _should_execute_as_shell(line: str, session: ShellSession) -> bool:
+    """Determine if a line should be executed as a shell command."""
+    
+    # Skip empty lines and comments
+    if not line or line.startswith('#'):
+        return False
+    
+    # If it contains an assignment operator (=, +=, etc.), it's Python
+    if any(op in line for op in ['=', '+=', '-=', '*=', '/=', '//=', '%=', '**=', '&=', '|=', '^=', '<<=', '>>=']):
+        # But not if it's a comparison (==, !=, <=, >=)
+        if not any(op in line for op in ['==', '!=', '<=', '>=']):
+            return False
+    
+    # Split into tokens for analysis
+    tokens = line.split()
+    if not tokens:
+        return False
+    
+    first_token = tokens[0]
+    
+    # Check if it's a guaranteed shell command
+    if first_token in GUARANTEED_COMMANDS:
+        return True
+    
+    # Check if it's available in PATH
+    if shutil.which(first_token):
+        return True
+    
+    # Check for shell operators
+    if any(op in line for op in ['|', '>', '<', '>>', '<<', '&&', '||']):
+        return True
+    
+    # Check for shell variable expansion patterns
+    if '$' in line and not line.startswith('$'):  # Don't treat pure $var as shell
+        return True
+    
+    # Try to parse as Python - if it fails, it might be shell
+    try:
+        ast.parse(line, mode='eval')
+        return False  # Valid Python expression
+    except SyntaxError:
+        # Could be a shell command or invalid Python
+        # Use heuristics: if first token looks like a command, treat as shell
+        if first_token.isidentifier() and not first_token in ['and', 'or', 'not', 'in', 'is']:
+            return True
+        return False
+
+
 def execute_line(line: str, session: ShellSession) -> int:
     # Handle multi-line Python code accumulation
     if session.in_multi_line:
@@ -1203,26 +1341,11 @@ def execute_line(line: str, session: ShellSession) -> int:
                 terminate_now = True
 
         if terminate_now:
-            source = '\n'.join(session.multi_line_buffer)
-            source_for_compile = source + '\n'
-            try:
-                compiled = session.command_compiler(source_for_compile, symbol='single')
-            except (SyntaxError, IndentationError, OverflowError, ValueError) as e:
-                session.multi_line_buffer = []
-                session.in_multi_line = False
-                session.current_indent_level = 0
-                sys.stderr.write(f"pysh: syntax error in multi-line code: {e}\n")
-                sys.stderr.flush()
-                return 1
-
-            if compiled is None:
-                return 0
-
-            rc = try_python(source, session)
+            rc = _execute_hybrid_multiline_buffer(session)
             session.multi_line_buffer = []
             session.in_multi_line = False
             session.current_indent_level = 0
-            return rc if rc is not None else 0
+            return rc
 
         _append_multiline_line(session, line)
         return 0
