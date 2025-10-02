@@ -8,7 +8,7 @@ pysh uses shell commands in PATH. If not found, it would look for variables and 
 > date
 Thu 25 Sep 2025 20:28:49 AEST
 > date = '11:05'
-<TODO: Placeholder for error msg>
+pysh: cannot assign to preserved command name: date
 > date
 Thu 25 Sep 2025 20:28:57 AEST   # date command is preserved and protected
 ```
