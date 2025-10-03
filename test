@@ -1,0 +1,72 @@
+#!/usr/bin/env sh
+# Single entry point for all testing
+
+usage() {
+    cat <<EOF
+Usage: ./test [OPTIONS]
+
+Options:
+    -e, --extend     Run all tests including extended suites
+    -c, --coverage   Run tests with coverage reporting
+    -h, --help       Show this help message
+
+Examples:
+    ./test                # Run base tests only
+    ./test -e             # Run all tests (base + extended)
+    ./test -c             # Run base tests with coverage
+    ./test -e -c          # Run all tests with coverage
+EOF
+}
+
+# Default options
+EXTEND=0
+COVERAGE=0
+
+# Parse arguments
+for arg in "$@"; do
+    case "$arg" in
+        -e|--extend)
+            EXTEND=1
+            ;;
+        -c|--coverage)
+            COVERAGE=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# Set PYTHONPATH to include src/
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$(pwd)/src"
+
+# Determine test files to run
+if [ $EXTEND -eq 1 ]; then
+    TESTS="tests/"
+else
+    TESTS="tests/test_shell_basics.py tests/interactive_loop_test.py"
+fi
+
+# Build and execute command
+if [ $COVERAGE -eq 1 ]; then
+    # Try pytest-cov first, then fall back to coverage module
+    if python3 -c "import pytest_cov" 2>/dev/null; then
+        exec pytest --cov=src --cov-report=term-missing $TESTS
+    elif python3 -c "import coverage" 2>/dev/null; then
+        python3 -m coverage run -m pytest $TESTS
+        exec python3 -m coverage report -m --include="src/*"
+    else
+        echo "Error: No coverage tool found. Install pytest-cov or coverage:"
+        echo "  pip install pytest-cov"
+        echo "  pip install coverage"
+        exit 1
+    fi
+else
+    exec pytest $TESTS
+fi
