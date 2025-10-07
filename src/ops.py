@@ -382,10 +382,16 @@ def try_python(line: str, session: ShellSession) -> Optional[int]:
     exec_locals.update(session.py_vars)
     
     # Add pysh helper functions to the execution context
-    def pysh_exec_shell_with_locals(cmd, local_vars):
-        # Temporarily update session.py_vars with current locals
+    def pysh_exec_shell_dynamic(cmd):
+        """Execute shell command with access to caller's local variables (function parameters)."""
+        import sys
+        # Get the caller's frame (the function calling __pysh_exec_shell)
+        frame = sys._getframe(1)
+        caller_locals = frame.f_locals
+        
+        # Temporarily update session.py_vars with caller's locals (includes function parameters)
         original_vars = dict(session.py_vars)
-        session.py_vars.update(local_vars)
+        session.py_vars.update(caller_locals)
         try:
             return _pysh_exec_shell_helper(cmd, session)
         finally:
@@ -395,11 +401,15 @@ def try_python(line: str, session: ShellSession) -> Optional[int]:
                     original_vars[k] = v
             session.py_vars = original_vars
     
-    exec_locals['__pysh_exec_shell'] = lambda cmd: pysh_exec_shell_with_locals(cmd, exec_locals)
+    # Create exec_globals with __pysh_exec_shell and session variables
+    # so functions can access both shell execution context and session variables
+    exec_globals = dict(session.py_vars)
+    exec_globals["__builtins__"] = __builtins__
+    exec_globals["__pysh_exec_shell"] = pysh_exec_shell_dynamic
     
     try:
         code = compile(tree, '<pysh>', 'exec')
-        exec(code, {"__builtins__": __builtins__}, exec_locals)
+        exec(code, exec_globals, exec_locals)
         # Sync back names (including imports)
         for k, v in exec_locals.items():
             if k in ("__builtins__", "__pysh_exec_shell"):
@@ -1263,9 +1273,9 @@ def _convert_line_for_hybrid_execution(line: str, session: ShellSession) -> str:
     # Get the indentation
     indent = line[:len(line) - len(line.lstrip())]
     
-    # Check if this is a Python control structure line
+    # Check if this is a Python control structure line or statement
     if any(stripped.startswith(keyword + ' ') or stripped.startswith(keyword + ':') or stripped == keyword + ':'
-           for keyword in ['for', 'while', 'if', 'elif', 'else', 'def', 'class', 'with', 'try', 'except', 'finally']):
+           for keyword in ['for', 'while', 'if', 'elif', 'else', 'def', 'class', 'with', 'try', 'except', 'finally', 'return', 'yield', 'break', 'continue', 'pass', 'raise', 'import', 'from', 'global', 'nonlocal', 'assert', 'del']):
         return line
     
     # Check if this line should be executed as shell

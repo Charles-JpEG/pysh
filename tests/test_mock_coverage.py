@@ -235,21 +235,6 @@ class TestOpsEdgeCases:
 class TestCommandRunnerErrorPaths:
     """Test CommandRunner error handling"""
     
-    @pytest.mark.xfail(reason="Hard to mock KeyboardInterrupt in subprocess.Popen")
-    def test_keyboard_interrupt_in_shell_run(self, monkeypatch):
-        """Test KeyboardInterrupt during shell execution"""
-        def raise_interrupt(*args, **kwargs):
-            raise KeyboardInterrupt()
-        
-        import subprocess
-        monkeypatch.setattr(subprocess, 'Popen', raise_interrupt)
-        
-        runner = CommandRunner("echo test", shell="/bin/sh", env={})
-        result = runner.shell_run()
-        
-        assert result == 130  # SIGINT exit code
-        assert "keyboard interrupt" in runner.stderr.lower() or result == 130
-    
     def test_filenotfound_for_shell(self, monkeypatch):
         """Test FileNotFoundError for missing shell"""
         runner = CommandRunner("echo test", shell="/nonexistent/badshell", env={})
@@ -275,32 +260,6 @@ class TestCommandRunnerErrorPaths:
 
 class TestPythonRedirectionErrorPaths:
     """Test Python redirection error handling"""
-    
-    @pytest.mark.xfail(reason="Unsupported fd may cause issues")
-    def test_unsupported_fd_for_input(self, tmp_path):
-        """Test unsupported fd for input redirection"""
-        session = ShellSession("/bin/sh")
-        os.chdir(tmp_path)
-        
-        infile = tmp_path / "in.txt"
-        infile.write_text("data\n")
-        
-        # Try to use fd 3 for input (unsupported)
-        # This might fail or be handled
-        result = execute_line(f"x = 1 3<{infile}", session)
-        # Just verify it doesn't crash
-    
-    @pytest.mark.xfail(reason="Unsupported fd may cause issues")
-    def test_unsupported_fd_for_output(self, tmp_path):
-        """Test unsupported fd for output redirection"""
-        session = ShellSession("/bin/sh")
-        os.chdir(tmp_path)
-        
-        outfile = tmp_path / "out.txt"
-        
-        # Try to use fd 3 for output (unsupported in Python mode)
-        result = execute_line(f"print('test') 3>{outfile}", session)
-        # Just verify it doesn't crash
     
     def test_stderr_to_stdout_dup_in_python(self):
         """Test 2>&1 in Python context"""

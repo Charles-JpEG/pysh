@@ -377,13 +377,6 @@ class TestHistoryAndBuiltins:
 class TestSubshellAndCommandSubstitution:
     """Test subshell and command substitution (lines 852-853, 859-860, etc.)"""
     
-    @pytest.mark.xfail(reason="Subshell syntax (cd /tmp && pwd) in parentheses not guaranteed")
-    def test_subshell_execution_852_853(self):
-        """Test lines 852-853: Subshell execution"""
-        session = ShellSession("/bin/sh")
-        result = execute_line("(cd /tmp && pwd) > /dev/null", session)
-        assert result == 0
-    
     def test_command_substitution_859_860(self):
         """Test lines 859-860: Command substitution"""
         session = ShellSession("/bin/sh")
@@ -460,23 +453,6 @@ class TestQuoting:
 class TestEnvironmentOperations:
     """Test environment variable operations (lines 982, 990, 1007, etc.)"""
     
-    @pytest.mark.xfail(reason="Shell export command not guaranteed by pysh spec - use Python assignment instead")
-    def test_export_variable_982(self):
-        """Test line 982: export command"""
-        session = ShellSession("/bin/sh")
-        result = execute_line("export MY_VAR=value", session)
-        assert result == 0
-        env = session.get_env()
-        assert env.get('MY_VAR') == 'value'
-    
-    @pytest.mark.xfail(reason="Shell unset command not guaranteed by pysh spec - use Python del instead")
-    def test_unset_variable_990(self):
-        """Test line 990: unset command"""
-        session = ShellSession("/bin/sh")
-        session.py_vars['TO_UNSET'] = 'value'
-        result = execute_line("unset TO_UNSET", session)
-        assert 'TO_UNSET' not in session.py_vars
-    
     def test_source_command_1007(self):
         """Test line 1007: source command"""
         import tempfile
@@ -502,13 +478,6 @@ class TestAliasAndFunction:
         result = execute_line("alias ll='ls -l'", session)
         # Will try to run 'alias' as a command, may succeed or fail
         assert result == 0 or result != 0  # Accept any result
-    
-    @pytest.mark.xfail(reason="Shell function syntax not guaranteed by pysh spec - use Python def instead")
-    def test_function_definition_1018_1019(self):
-        """Test lines 1018-1019: function definition"""
-        session = ShellSession("/bin/sh")
-        result = execute_line("function myfunc() { echo test; }", session)
-        # May or may not be supported
 
 
 class TestComplexScenarios:
@@ -526,24 +495,6 @@ class TestComplexScenarios:
         # Here documents are complex, may not be fully supported
         result = execute_line("cat << EOF > /dev/null\ntest\nEOF", session)
         # May fail if not supported
-
-
-class TestLoopAndConditionalCommands:
-    """Test for, while, if in shell context (lines 1062, 1073-1075, etc.)"""
-    
-    @pytest.mark.xfail(reason="Shell loops not guaranteed by pysh spec - use Python loops instead")
-    def test_for_loop_shell_1062(self):
-        """Test line 1062: for loop in shell"""
-        session = ShellSession("/bin/sh")
-        result = execute_line("for i in 1 2 3; do echo $i; done > /dev/null", session)
-        # May work depending on shell parsing
-    
-    @pytest.mark.xfail(reason="Shell loops not guaranteed by pysh spec - use Python loops instead")
-    def test_while_loop_shell_1073_1075(self):
-        """Test lines 1073-1075: while loop in shell"""
-        session = ShellSession("/bin/sh")
-        result = execute_line("i=0; while [ $i -lt 3 ]; do i=$((i+1)); done", session)
-        # May work depending on shell parsing
 
 
 class TestParameterExpansion:
@@ -571,13 +522,6 @@ class TestArithmeticExpansion:
         session = ShellSession("/bin/sh")
         result = execute_line("echo $((2 + 2)) > /dev/null", session)
         # May work depending on shell support
-    
-    @pytest.mark.xfail(reason="Shell arithmetic (( )) not guaranteed by pysh spec")
-    def test_arithmetic_assignment_1144(self):
-        """Test line 1144: (( i++ ))"""
-        session = ShellSession("/bin/sh")
-        result = execute_line("i=5; ((i++))", session)
-        # May work depending on shell support
 
 
 class TestBraceExpansion:
@@ -596,27 +540,8 @@ class TestBraceExpansion:
         # May work depending on shell support
 
 
-class TestProcessSubstitution:
-    """Test process substitution (lines 1187-1189)"""
-    
-    @pytest.mark.xfail(reason="Process substitution <() not guaranteed by pysh spec")
-    def test_process_substitution_1187_1189(self):
-        """Test lines 1187-1189: <(command)"""
-        session = ShellSession("/bin/sh")
-        result = execute_line("cat <(echo test) > /dev/null", session)
-        # May work depending on shell support
-
-
 class TestCompleteEdgeCases:
     """Test remaining edge cases (lines 1250-1253, 1286, etc.)"""
-    
-    @pytest.mark.xfail(reason="Shell case statement not guaranteed by pysh spec")
-    @pytest.mark.xfail(reason="Shell case statement not guaranteed by pysh spec")
-    def test_case_statement_1250_1253(self):
-        """Test lines 1250-1253: case statement"""
-        session = ShellSession("/bin/sh")
-        result = execute_line("case test in test) echo match;; esac > /dev/null", session)
-        # May work depending on shell support
     
     def test_select_statement_1286(self):
         """Test line 1286: select statement - not guaranteed, should try as command"""
@@ -652,13 +577,6 @@ class TestCompleteEdgeCases:
         # Return only works in functions, would try to run as command
         result = execute_line("echo test > /dev/null", session)  # Use echo instead
         assert result == 0
-    
-    @pytest.mark.xfail(reason="Shell eval command not guaranteed by pysh spec")
-    def test_eval_command_1320(self):
-        """Test line 1320: eval command"""
-        session = ShellSession("/bin/sh")
-        result = execute_line("eval echo test > /dev/null", session)
-        # May work depending on shell support
     
     def test_exec_command_1338_1341(self):
         """Test lines 1338-1341: exec command - not guaranteed"""

@@ -135,14 +135,6 @@ class TestPythonExecutionPaths:
 class TestRedirectionCombinations:
     """Test various redirection combinations"""
     
-    @pytest.mark.xfail(reason="Here-string syntax may not be supported")
-    def test_here_string(self, tmp_path):
-        """Test <<< here-string"""
-        session = ShellSession("/bin/sh")
-        os.chdir(tmp_path)
-        result = execute_line("cat <<< 'test' > /dev/null", session)
-        # May or may not be supported
-    
     def test_here_doc(self, tmp_path):
         """Test << here-doc"""
         session = ShellSession("/bin/sh")

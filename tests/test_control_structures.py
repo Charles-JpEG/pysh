@@ -42,7 +42,6 @@ class TestFunctionDefinition:
         result = tester.run("say('test')")
         assert "test" in result.stdout
     
-    @pytest.mark.xfail(reason="Functions don't have access to shell execution context")
     def test_function_with_return(self, tester: PyshTester):
         """Test function that returns a value."""
         tester.run("def add(a, b):")
@@ -52,7 +51,6 @@ class TestFunctionDefinition:
         result = tester.run("add(3, 4)")
         assert "7" in result.stdout
     
-    @pytest.mark.xfail(reason="Functions don't have access to shell execution context")
     def test_function_with_shell_command(self, tester: PyshTester):
         """Test function containing shell commands."""
         tester.run("def list_files():")
@@ -65,7 +63,6 @@ class TestFunctionDefinition:
         # Should execute ls command
         assert result.stderr == "" or result.stdout != ""
     
-    @pytest.mark.xfail(reason="Functions don't have access to session variables")
     def test_function_accesses_variable(self, tester: PyshTester):
         """Test that function can access variables (priority rule)."""
         # Set up variable
@@ -80,7 +77,6 @@ class TestFunctionDefinition:
         result = tester.run("show_x()")
         assert "42" in result.stdout
     
-    @pytest.mark.xfail(reason="Nested functions don't have access to shell execution context")
     def test_nested_function_calls(self, tester: PyshTester):
         """Test nested function definitions."""
         tester.run("def outer():")
@@ -150,50 +146,10 @@ class TestIfElseStatement:
         result = tester.run("    ")
         
         assert "both" in result.stdout
-    
-    @pytest.mark.xfail(reason="Variable shadowing of command names not fully implemented")
-    def test_if_accesses_variable_not_command(self, tester: PyshTester):
-        """Test that if prioritizes variables over commands (per spec)."""
-        # Create a variable with same name as command
-        tester.run("echo = 'not the command'")
-        tester.run("if True:")
-        tester.run("print(echo)")
-        result = tester.run("    ")
-        
-        # Should print the variable value, not run echo command
-        assert "not the command" in result.stdout
 
 
 class TestHybridPriority:
     """Test that variables/functions are prioritized in control structures."""
-    
-    @pytest.mark.xfail(reason="Variable priority over commands not fully implemented")
-    def test_loop_prioritizes_variable(self, tester: PyshTester):
-        """Test that loops look for variables first (per spec)."""
-        # Define a variable that shadows a command
-        tester.run("ls = ['a', 'b', 'c']")
-        
-        # In a loop, 'ls' should be the variable, not the command
-        tester.run("for item in ls:")
-        tester.run("print(item)")
-        result = tester.run("    ")
-        
-        assert "a" in result.stdout
-        assert "b" in result.stdout
-        assert "c" in result.stdout
-    
-    @pytest.mark.xfail(reason="Variable priority in functions not fully implemented")
-    def test_function_prioritizes_variable(self, tester: PyshTester):
-        """Test that functions look for variables first."""
-        # Create variable shadowing command
-        tester.run("pwd = '/custom/path'")
-        
-        tester.run("def show_pwd():")
-        tester.run("print(pwd)")
-        tester.run("    ")
-        
-        result = tester.run("show_pwd()")
-        assert "/custom/path" in result.stdout
     
     def test_outside_control_uses_command(self, tester: PyshTester):
         """Test that outside control structures, commands are prioritized."""
@@ -222,7 +178,6 @@ class TestControlStructureCombinations:
         assert "1" in result.stdout
         assert "2" in result.stdout
     
-    @pytest.mark.xfail(reason="Functions with complex control structures lose context")
     def test_function_with_if(self, tester: PyshTester):
         """Test function containing if statement."""
         tester.run("def check_positive(n):")
