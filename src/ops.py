@@ -382,10 +382,16 @@ def try_python(line: str, session: ShellSession) -> Optional[int]:
     exec_locals.update(session.py_vars)
     
     # Add pysh helper functions to the execution context
-    def pysh_exec_shell_with_locals(cmd, local_vars):
-        # Temporarily update session.py_vars with current locals
+    def pysh_exec_shell_dynamic(cmd):
+        """Execute shell command with access to caller's local variables (function parameters)."""
+        import sys
+        # Get the caller's frame (the function calling __pysh_exec_shell)
+        frame = sys._getframe(1)
+        caller_locals = frame.f_locals
+        
+        # Temporarily update session.py_vars with caller's locals (includes function parameters)
         original_vars = dict(session.py_vars)
-        session.py_vars.update(local_vars)
+        session.py_vars.update(caller_locals)
         try:
             return _pysh_exec_shell_helper(cmd, session)
         finally:
@@ -399,7 +405,7 @@ def try_python(line: str, session: ShellSession) -> Optional[int]:
     # so functions can access both shell execution context and session variables
     exec_globals = dict(session.py_vars)
     exec_globals["__builtins__"] = __builtins__
-    exec_globals["__pysh_exec_shell"] = lambda cmd: pysh_exec_shell_with_locals(cmd, exec_locals)
+    exec_globals["__pysh_exec_shell"] = pysh_exec_shell_dynamic
     
     try:
         code = compile(tree, '<pysh>', 'exec')
