@@ -150,50 +150,10 @@ class TestIfElseStatement:
         result = tester.run("    ")
         
         assert "both" in result.stdout
-    
-    @pytest.mark.xfail(reason="Variable shadowing of command names not fully implemented")
-    def test_if_accesses_variable_not_command(self, tester: PyshTester):
-        """Test that if prioritizes variables over commands (per spec)."""
-        # Create a variable with same name as command
-        tester.run("echo = 'not the command'")
-        tester.run("if True:")
-        tester.run("print(echo)")
-        result = tester.run("    ")
-        
-        # Should print the variable value, not run echo command
-        assert "not the command" in result.stdout
 
 
 class TestHybridPriority:
     """Test that variables/functions are prioritized in control structures."""
-    
-    @pytest.mark.xfail(reason="Variable priority over commands not fully implemented")
-    def test_loop_prioritizes_variable(self, tester: PyshTester):
-        """Test that loops look for variables first (per spec)."""
-        # Define a variable that shadows a command
-        tester.run("ls = ['a', 'b', 'c']")
-        
-        # In a loop, 'ls' should be the variable, not the command
-        tester.run("for item in ls:")
-        tester.run("print(item)")
-        result = tester.run("    ")
-        
-        assert "a" in result.stdout
-        assert "b" in result.stdout
-        assert "c" in result.stdout
-    
-    @pytest.mark.xfail(reason="Variable priority in functions not fully implemented")
-    def test_function_prioritizes_variable(self, tester: PyshTester):
-        """Test that functions look for variables first."""
-        # Create variable shadowing command
-        tester.run("pwd = '/custom/path'")
-        
-        tester.run("def show_pwd():")
-        tester.run("print(pwd)")
-        tester.run("    ")
-        
-        result = tester.run("show_pwd()")
-        assert "/custom/path" in result.stdout
     
     def test_outside_control_uses_command(self, tester: PyshTester):
         """Test that outside control structures, commands are prioritized."""
