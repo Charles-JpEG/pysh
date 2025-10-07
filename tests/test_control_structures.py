@@ -42,7 +42,6 @@ class TestFunctionDefinition:
         result = tester.run("say('test')")
         assert "test" in result.stdout
     
-    @pytest.mark.xfail(reason="Functions don't have access to shell execution context")
     def test_function_with_return(self, tester: PyshTester):
         """Test function that returns a value."""
         tester.run("def add(a, b):")
@@ -78,7 +77,6 @@ class TestFunctionDefinition:
         result = tester.run("show_x()")
         assert "42" in result.stdout
     
-    @pytest.mark.xfail(reason="Nested functions don't have access to shell execution context")
     def test_nested_function_calls(self, tester: PyshTester):
         """Test nested function definitions."""
         tester.run("def outer():")
@@ -180,7 +178,6 @@ class TestControlStructureCombinations:
         assert "1" in result.stdout
         assert "2" in result.stdout
     
-    @pytest.mark.xfail(reason="Functions with complex control structures lose context")
     def test_function_with_if(self, tester: PyshTester):
         """Test function containing if statement."""
         tester.run("def check_positive(n):")

@@ -1273,9 +1273,9 @@ def _convert_line_for_hybrid_execution(line: str, session: ShellSession) -> str:
     # Get the indentation
     indent = line[:len(line) - len(line.lstrip())]
     
-    # Check if this is a Python control structure line
+    # Check if this is a Python control structure line or statement
     if any(stripped.startswith(keyword + ' ') or stripped.startswith(keyword + ':') or stripped == keyword + ':'
-           for keyword in ['for', 'while', 'if', 'elif', 'else', 'def', 'class', 'with', 'try', 'except', 'finally']):
+           for keyword in ['for', 'while', 'if', 'elif', 'else', 'def', 'class', 'with', 'try', 'except', 'finally', 'return', 'yield', 'break', 'continue', 'pass', 'raise', 'import', 'from', 'global', 'nonlocal', 'assert', 'del']):
         return line
     
     # Check if this line should be executed as shell
