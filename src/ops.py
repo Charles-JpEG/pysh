@@ -395,11 +395,15 @@ def try_python(line: str, session: ShellSession) -> Optional[int]:
                     original_vars[k] = v
             session.py_vars = original_vars
     
-    exec_locals['__pysh_exec_shell'] = lambda cmd: pysh_exec_shell_with_locals(cmd, exec_locals)
+    # Create exec_globals with __pysh_exec_shell and session variables
+    # so functions can access both shell execution context and session variables
+    exec_globals = dict(session.py_vars)
+    exec_globals["__builtins__"] = __builtins__
+    exec_globals["__pysh_exec_shell"] = lambda cmd: pysh_exec_shell_with_locals(cmd, exec_locals)
     
     try:
         code = compile(tree, '<pysh>', 'exec')
-        exec(code, {"__builtins__": __builtins__}, exec_locals)
+        exec(code, exec_globals, exec_locals)
         # Sync back names (including imports)
         for k, v in exec_locals.items():
             if k in ("__builtins__", "__pysh_exec_shell"):

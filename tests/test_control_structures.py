@@ -52,7 +52,6 @@ class TestFunctionDefinition:
         result = tester.run("add(3, 4)")
         assert "7" in result.stdout
     
-    @pytest.mark.xfail(reason="Functions don't have access to shell execution context")
     def test_function_with_shell_command(self, tester: PyshTester):
         """Test function containing shell commands."""
         tester.run("def list_files():")
@@ -65,7 +64,6 @@ class TestFunctionDefinition:
         # Should execute ls command
         assert result.stderr == "" or result.stdout != ""
     
-    @pytest.mark.xfail(reason="Functions don't have access to session variables")
     def test_function_accesses_variable(self, tester: PyshTester):
         """Test that function can access variables (priority rule)."""
         # Set up variable
