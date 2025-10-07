@@ -31,9 +31,20 @@ from contextlib import redirect_stderr
 from ops import ShellSession, execute_line, CommandRunner, try_python  # type: ignore
 
 
+# Regular pytest test files (run without -e flag)
 PYTEST_SUITES = [
     ROOT / "tests" / "test_shell_basics.py",
     ROOT / "tests" / "interactive_loop_test.py",
+]
+
+# Extended pytest test files (run with -e flag)
+PYTEST_EXTENDED_SUITES = [
+    ROOT / "tests" / "test_variables.py",
+    ROOT / "tests" / "test_control_structures.py",
+    ROOT / "tests" / "test_advanced_features.py",
+    ROOT / "tests" / "test_shell_detection.py",
+    ROOT / "tests" / "test_main_functions.py",
+    ROOT / "tests" / "test_ops_functions.py",
 ]
 
 
@@ -1696,6 +1707,7 @@ def test_compare_pysh_vs_shell_phonebook(sess: ShellSession, tmp: Path):
 
 
 def pytest_extended_suite(sess: ShellSession, tmp: Path):
+    """Run extended pytest test suites (comprehensive coverage tests)."""
     try:
         import pytest  # type: ignore
     except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
@@ -1704,13 +1716,14 @@ def pytest_extended_suite(sess: ShellSession, tmp: Path):
     original_cwd = Path.cwd()
     try:
         os.chdir(ROOT)
-        args = ["-q", *[str(path) for path in PYTEST_SUITES]]
+        # Run all extended test files
+        args = ["-q", "--tb=short", *[str(path) for path in PYTEST_EXTENDED_SUITES]]
         exit_code = pytest.main(args)
     finally:
         os.chdir(original_cwd)
 
     if exit_code != 0:
-        raise AssertionError(f"pytest suite failed (exit code {exit_code})")
+        raise AssertionError(f"pytest extended suite failed (exit code {exit_code})")
 
 
 def collect_tests(extend: bool):
