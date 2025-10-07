@@ -73,18 +73,27 @@ class TestReadlineEnabledPaths:
     
     def test_readline_clear_hook_regular_prompt(self, monkeypatch):
         """Test line 158: Clear readline hook on regular prompt"""
-        # Mock readline
+        # Mock readline BEFORE main module uses it
         readline_mock = MagicMock()
         readline_mock.set_pre_input_hook = MagicMock()
+        
+        # Need to reload main module with our mocked readline
+        import importlib
         sys.modules['readline'] = readline_mock
         
-        # Enable readline in main
-        monkeypatch.setattr(main, 'READLINE_ACTIVE', True)
+        # Reload main to pick up the mocked readline
+        importlib.reload(main)
+        
+        # Mock sys.stdin.isatty to return True so readline_enabled is True
+        stdin_mock = MagicMock()
+        stdin_mock.isatty.return_value = True
+        monkeypatch.setattr('sys.stdin', stdin_mock)
         
         try:
             # Simulate commands
             inputs = iter([
                 'x = 1',         # Regular command - triggers line 158
+                '',              # Empty line to trigger regular prompt path
                 'exit()'
             ])
             monkeypatch.setattr('builtins.input', lambda _: next(inputs))
@@ -96,10 +105,13 @@ class TestReadlineEnabledPaths:
                     pass
                     
             # Verify set_pre_input_hook(None) was called (line 158)
+            # The hook should be cleared when not in multiline mode
             assert readline_mock.set_pre_input_hook.called
         finally:
             if 'readline' in sys.modules:
                 del sys.modules['readline']
+            # Reload main again to restore original state
+            importlib.reload(main)
 
 
 class TestExceptionInExecuteLine:
