@@ -1280,8 +1280,15 @@ def _convert_line_for_hybrid_execution(line: str, session: ShellSession) -> str:
     
     # Check if this line should be executed as shell
     if _should_execute_as_shell(stripped, session):
-        # Instead of subprocess, use a simpler approach that calls the existing execute_line function
-        shell_code = f"__pysh_exec_shell({repr(stripped)})"
+        # Escape only the characters that would break Python string syntax
+        # Don't escape backslashes to preserve shell escape sequences
+        if "'''" in stripped:
+            # Use double triple-quotes if single triple-quotes are present
+            escaped = stripped.replace('"""', r'\"\"\"')
+            shell_code = f'__pysh_exec_shell("""{escaped}""")'
+        else:
+            # Use single triple-quotes
+            shell_code = f"__pysh_exec_shell('''{stripped}''')"
         return indent + shell_code
     
     # Regular Python line
@@ -1294,12 +1301,6 @@ def _should_execute_as_shell(line: str, session: ShellSession) -> bool:
     # Skip empty lines and comments
     if not line or line.startswith('#'):
         return False
-    
-    # If it contains an assignment operator (=, +=, etc.), it's Python
-    if any(op in line for op in ['=', '+=', '-=', '*=', '/=', '//=', '%=', '**=', '&=', '|=', '^=', '<<=', '>>=']):
-        # But not if it's a comparison (==, !=, <=, >=)
-        if not any(op in line for op in ['==', '!=', '<=', '>=']):
-            return False
     
     # Split into tokens for analysis
     tokens = line.split()
@@ -1326,14 +1327,30 @@ def _should_execute_as_shell(line: str, session: ShellSession) -> bool:
     
     # Try to parse as Python - if it fails, it might be shell
     try:
-        ast.parse(line, mode='eval')
-        return False  # Valid Python expression
+        tree = ast.parse(line, mode='exec')
+        # If it parses as Python and contains assignment-like statements, treat as Python
+        # This handles cases like "x = 10" or "a, b = 1, 2"
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                return False
+        # Parse successfully but no assignment - could be expression or shell
+        # Try parsing as eval to check if it's a valid Python expression
+        try:
+            ast.parse(line, mode='eval')
+            return False  # Valid Python expression
+        except SyntaxError:
+            pass
     except SyntaxError:
         # Could be a shell command or invalid Python
         # Use heuristics: if first token looks like a command, treat as shell
         if first_token.isidentifier() and not first_token in ['and', 'or', 'not', 'in', 'is']:
             return True
         return False
+    
+    # Default: if we can't determine, treat as shell if first token is identifier-like
+    if first_token.isidentifier():
+        return True
+    return False
 
 
 def execute_line(line: str, session: ShellSession) -> int:
