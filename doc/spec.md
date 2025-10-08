@@ -42,6 +42,24 @@ these commands are well tested and should work fine
 - pysh loop uses python loop syntax, such as TODO
 - same for def and if/else
 
+### Example
+```pysh
+> for i in range(3):
+...     echo $i
+...     
+0
+1
+2
+>
+> def hello():
+...     print("Hello", end=" ")
+...     echo World
+...     
+> hello()
+World
+pysh>           # TODO: Bug occurs, print not printing anything
+```
+
 
 ## Hybrid commands
 - pysh supports combining mixing shell and python commands together.
