@@ -19,6 +19,12 @@ All variables, including environment variables, are managed by python. This is o
 - Traditional method like $var would still be prased into string, but it's also a python string. 
 - pysh also holds generic python variables, to access them, simply write python code
 
+### Example usage:
+```pysh
+> PWD   # This is same as "print(PWD)", equivalent to "echo $PWD"
+/home/dev/Projects/pysh
+```
+
 
 ## Guaranteed shell commands
 these commands are well tested and should work fine
@@ -29,7 +35,7 @@ these commands are well tested and should work fine
 
 ### Hints:
 - All variables are managed by python, including shell env variables. Access them as if you're writing in python, or if need string repr, use $var instead
-- grep would enable Perl mode (-P) by default, use -G to use BRE
+- grep would enable Perl mode (-P) by default, use -G to use BRE, or -E to use ERE
 
 
 ## Loop, functions and if-else
@@ -41,3 +47,4 @@ these commands are well tested and should work fine
 - pysh supports combining mixing shell and python commands together.
 - Generally pysh would prioritize shell commands, but within functions, loops or if-else conditions, pysh will look for variables and functions first.
 - Notice that if link pipeline commands, '|' will only pass the output to stdout to next command, not the return value
+
