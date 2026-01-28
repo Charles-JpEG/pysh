@@ -2,13 +2,25 @@
 Combine python3 and posix shell
 
 ## Overview
-A project to combine python3 and posix shell, try it out if you're suffering from scripting with bash
+The purpose of pysh is to have python running like a shell, take advantage of CLI tools and python features at the same time.
 
 ## Dependencies
-At least one posix compliant shell and python3
-- Use grep -G if your grep version does not support -P Perl regex, or install a newer GNU grep
+- At least one posix compliant shell
+- Python3
 
-## Usage \<Not yet implemented\>
-- Very similar to the shell you're used to, you can still cd to change directory or grep to filter output
-- Besides you can use python functions directly like print()
-- use import to load python modules
+## Example usage
+```pysh
+$ pysh
+>> cd ~/Projects/demo
+>> cat users.psv
+Alex | 1
+Ben | 2
+Cindy | 3
+David | 4
+Emma | 5
+>> users = [line.strip() for line in $(cat users.psv)]
+>> for user in users:
+...    match = re.match(r"^(\w+)\s\|", user)
+...    if match:
+...        print(match.group(1))
+```
